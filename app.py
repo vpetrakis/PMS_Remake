@@ -79,12 +79,15 @@ def process_tec19_files(uploaded_files) -> list:
     return all_extracted_data
 
 def spatial_lock_pms(excel_bytes) -> tuple:
-    """Strict Header Enforcement for Excel."""
+    """Strict Header Enforcement for Excel. Now wrapped safely in io.BytesIO"""
     try:
-        df = pd.read_excel(excel_bytes, engine='openpyxl')
+        # THE FIX: excel_bytes is wrapped so Pandas can read it from memory
+        df = pd.read_excel(io.BytesIO(excel_bytes), engine='openpyxl')
         df.columns = df.columns.str.strip()
+        
         missing = [col for col in PMS_LOCKED_COLS if col not in df.columns]
         if missing: return None, f"Missing exact columns: {missing}"
+        
         return df[PMS_LOCKED_COLS].dropna(subset=["Component Name"]), None
     except Exception as e:
         return None, f"Excel parsing error: {str(e)}"
@@ -186,7 +189,8 @@ def main():
         st.divider()
         audit_date = st.date_input("Select Date of Audit (For Physical Limits Math)")
         
-        pms_file = st.file_uploader("1. Master PMS Ledger (Excel)", type=['xlsx', 'xls'])
+        # Note: If your file is .xls, 'openpyxl' engine might complain. Make sure to upload .xlsx files for PMS.
+        pms_file = st.file_uploader("1. Master PMS Ledger (Excel .xlsx)", type=['xlsx'])
         tec_files = st.file_uploader("2. TEC-19 Logs (Word)", type=['doc', 'docx'], accept_multiple_files=True) 
         
         if st.button("▶ Execute Audit", type="primary", use_container_width=True):
