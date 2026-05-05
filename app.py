@@ -1,131 +1,192 @@
 import streamlit as st
 import pandas as pd
+from docx import Document
 import jellyfish
 import re
 import nltk
 from nltk.tokenize import sent_tokenize
 import io
 
-# Initialize NLTK quietly
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    nltk.download('punkt', quiet=True)
+# ---------------------------------------------------------
+# SYSTEM INITIALIZATION & CACHING
+# ---------------------------------------------------------
+@st.cache_resource
+def init_nlp():
+    """Silently load NLTK to prevent mid-execution crashes."""
+    try:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
+        nltk.download('punkt', quiet=True)
 
-# ==========================================
-# BACKEND: ZERO-TRUST NLP & DATA ENGINE
-# ==========================================
+init_nlp()
 
+# ---------------------------------------------------------
+# THE ZERO-TRUST ENGINE
+# ---------------------------------------------------------
 class TemporalEngine:
     def __init__(self):
-        self.banned_keywords = {"CHECK", "INSPECT", "INSP", "CLEAN", "TEST", "MEASURE"}
-        self.target_events = {"OVERHAUL", "RENEW", "REPLACE", "CHANGE"}
+        # Weighted Shield: Action words OVERPOWER Inspection words.
+        self.action_words = {"OVERHAUL", "RENEW", "REPLACE", "CHANGE", "PULLED OUT", "DISMANTLED"}
+        self.inspection_words = {"CHECK", "INSPECT", "INSP", "CLEAN", "TEST", "MEASURE"}
         self.pms_locked_cols = ["Component Name", "Last Overhaul Date", "Total Running Hours"]
 
-    def spatial_lock_pms(self, excel_file):
-        """Phase 1: Read Excel but lock onto specific columns only."""
+    def spatial_lock_pms(self, excel_bytes) -> pd.DataFrame:
+        """Phase 1: Ingest Excel with strict spatial locks."""
         try:
-            df = pd.read_excel(excel_file, usecols=lambda c: c in self.pms_locked_cols)
-            return df
+            # Force string conversion on names, dates can be parsed later
+            df = pd.read_excel(excel_bytes, usecols=lambda c: c.strip() in self.pms_locked_cols)
+            if df.empty or len(df.columns) < 3:
+                return pd.DataFrame() # Trigger lock failure
+            return df.dropna(subset=["Component Name"]) # Drop empty rows
         except Exception as e:
-            return pd.DataFrame() # Return empty on failure to trigger Zero-Trust halt
+            return pd.DataFrame()
 
-    def anti_inspection_shield(self, text: str):
-        """Phase 2: Filter out routine checks, keep major events."""
-        if not isinstance(text, str): return ""
-        sentences = sent_tokenize(text.upper())
-        valid_sentences = []
-        for sentence in sentences:
-            tokens = set(re.findall(r'\b\w+\b', sentence))
-            if tokens.intersection(self.banned_keywords):
-                continue
-            if tokens.intersection(self.target_events):
-                valid_sentences.append(sentence)
-        return " ".join(valid_sentences)
-
-    def extract_phonetic_tokens(self, text: str):
-        """Phase 3: Alphanumeric Metaphone tokenization."""
-        clean_text = re.sub(r'[^A-Z0-9\s]', '', str(text).upper())
-        return set(jellyfish.metaphone(token) for token in clean_text.split())
-
-    def run_reconciliation(self, pms_df, tec19_data):
-        """Phase 4 & 5: Cross-reference and route to Quarantine/Syncs."""
-        # Note: This is a simplified logic mock for the monolithic structure
-        results = {"Verified Syncs": [], "Ghost Overhauls": [], "Unlogged": [], "Quarantine Bay": []}
+    def multi_layer_word_extraction(self, word_bytes) -> list:
+        """Phase 2: Hybrid Table & Regex extraction to defeat bad Word formatting."""
+        doc = Document(word_bytes)
+        extracted_data = []
         
-        # Example logic routing
-        for index, row in pms_df.iterrows():
-            comp_name = str(row.get('Component Name', ''))
-            if not comp_name: continue
+        # Layer 1: Attempt standard Table Extraction
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if len(cells) >= 3:
+                    # Look for date patterns (DD-MM-YY) to anchor the data
+                    date_match = re.search(r'\b\d{2}-\d{2}-\d{2}\b', " ".join(cells))
+                    if date_match:
+                        # Assume the longest text cell is the Job Description
+                        job_desc = max(cells, key=len) 
+                        extracted_data.append({"Text": job_desc, "Date": date_match.group(0), "Method": "Table"})
+
+        # Layer 2: Regex Fallback (If tables were merged/broken, read raw paragraphs)
+        if len(extracted_data) < 5: 
+            for para in doc.paragraphs:
+                text = para.text.strip()
+                date_match = re.search(r'\b\d{2}-\d{2}-\d{2}\b', text)
+                if date_match and len(text) > 15:
+                    extracted_data.append({"Text": text, "Date": date_match.group(0), "Method": "Regex Fallback"})
+
+        return extracted_data
+
+    def apply_shield(self, text: str) -> bool:
+        """Phase 3: The Weighted Anti-Inspection Shield."""
+        text_upper = text.upper()
+        
+        # If it has an action word, it passes, regardless of check words.
+        if any(action in text_upper for action in self.action_words):
+            return True
             
-            pms_tokens = self.extract_phonetic_tokens(comp_name)
-            # In a full run, we would compare this against every filtered TEC-19 entry
-            # For demonstration, routing everything to Quarantine to enforce Zero-Trust
-            results["Quarantine Bay"].append({
-                "Component": comp_name,
-                "Reason": "Pending deep temporal cross-reference"
-            })
+        # If it has check words and NO action words, it is blocked.
+        if any(insp in text_upper for insp in self.inspection_words):
+            return False
             
+        return False # Default to block (Zero-Trust)
+
+    def extract_phonetic_tokens(self, text: str) -> set:
+        """Phase 4: Alphanumeric Metaphone generation."""
+        clean_text = re.sub(r'[^A-Z0-9\s]', '', str(text).upper())
+        return set(jellyfish.metaphone(token) for token in clean_text.split() if len(token) > 2)
+
+    def run_reconciliation(self, pms_df, tec19_entries):
+        """Phase 5: Cross-reference logic routing."""
+        results = {"Syncs": [], "Ghost": [], "Unlogged": [], "Quarantine": []}
+        
+        # Filter TEC-19 through the Shield
+        filtered_logs = [log for log in tec19_entries if self.apply_shield(log["Text"])]
+        
+        # If nothing passed the shield, everything goes to Quarantine to prevent silent failure
+        if not filtered_logs:
+            results["Quarantine"].append({"Error": "Critical: No valid maintenance events survived the Anti-Inspection Shield."})
+            return results
+
+        # Simplistic matching for demonstration (Production would use Date-Delta math here)
+        for _, row in pms_df.iterrows():
+            pms_comp = str(row['Component Name'])
+            pms_tokens = self.extract_phonetic_tokens(pms_comp)
+            
+            matched = False
+            for log in filtered_logs:
+                log_tokens = self.extract_phonetic_tokens(log["Text"])
+                intersection = pms_tokens.intersection(log_tokens)
+                
+                # Confidence Threshold: 40% of phonetic tokens must match to trigger a review
+                if len(pms_tokens) > 0 and (len(intersection) / len(pms_tokens)) > 0.4:
+                    results["Quarantine"].append({
+                        "PMS Component": pms_comp,
+                        "TEC-19 Entry": log["Text"],
+                        "Date Recorded": log["Date"],
+                        "Status": "Partial Match Detected - Requires Human Verification"
+                    })
+                    matched = True
+                    break
+            
+            if not matched:
+                results["Ghost"].append({"Component Name": pms_comp, "PMS Date Claim": str(row.get('Last Overhaul Date', 'N/A'))})
+                
         return results
 
-# ==========================================
-# FRONTEND: STREAMLIT UI
-# ==========================================
+# ---------------------------------------------------------
+# FRONTEND: NAVIGATIONAL UI
+# ---------------------------------------------------------
+st.set_page_config(page_title="Temporal Pipeline", layout="wide", initial_sidebar_state="expanded")
 
 def main():
-    st.set_page_config(page_title="Temporal Reconciliation Pipeline", layout="wide")
     engine = TemporalEngine()
 
-    # --- Header ---
-    st.title("⚓ Temporal Reconciliation Pipeline")
-    st.markdown("**Zero-Trust Auditing:** Cross-referencing PMS Master Ledgers against TEC-19 Diaries.")
-    st.divider()
+    with st.sidebar:
+        st.title("⚓ Pipeline Controls")
+        st.markdown("Upload documents to initiate Zero-Trust Audit.")
+        st.divider()
+        pms_file = st.file_uploader("1. Master PMS (Excel)", type=['xlsx'])
+        tec_file = st.file_uploader("2. TEC-19 Log (Word)", type=['docx', 'doc'])
+        run_audit = st.button("▶ Run Audit Engine", use_container_width=True, type="primary")
 
-    # --- Upload Area ---
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("1. Master PMS Ledger")
-        pms_file = st.file_uploader("Upload Excel (.xlsx)", type=['xlsx', 'xls'])
+    st.title("Temporal Reconciliation Dashboard")
     
-    with col2:
-        st.subheader("2. TEC-19 Work Schedule")
-        tec19_file = st.file_uploader("Upload Word/Text (.doc, .docx, .txt)", type=['docx', 'doc', 'txt'])
-
-    # --- Execution Logic ---
-    if pms_file and tec19_file:
-        st.success("Files securely loaded. Initiating Spatial Locks and Anti-Inspection Shields...")
-        
-        with st.spinner("Reconciling timelines..."):
-            # 1. Process PMS
-            pms_df = engine.spatial_lock_pms(pms_file)
+    if run_audit and pms_file and tec_file:
+        with st.spinner("Locking coordinates and applying NLP shields..."):
             
+            # 1. Ingest Data
+            pms_df = engine.spatial_lock_pms(pms_file)
+            tec_data = engine.multi_layer_word_extraction(tec_file)
+
+            # 2. Check Integrity
             if pms_df.empty:
-                st.error("🚨 CRITICAL: Spatial Column Lock Failed. Could not find exact headers in PMS.")
+                st.error("🚨 Ingestion Halted: Failed to lock onto PMS headers (Component Name, Last Overhaul Date, Total Running Hours).")
+                st.stop()
+            if not tec_data:
+                st.error("🚨 Ingestion Halted: Multi-Layer extraction failed to find chronological data in the Word file.")
                 st.stop()
 
-            # 2. Process TEC-19 (Mocking extraction for this layout)
-            # tec19_text = docx_parser(tec19_file) 
-            
-            # 3. Run Engine
-            audit_results = engine.run_reconciliation(pms_df, "mock_tec_data")
+            # 3. Reconcile
+            results = engine.run_reconciliation(pms_df, tec_data)
 
-        # --- Dashboard Output ---
-        st.divider()
-        st.header("Audit Results")
-        
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Verified Syncs", len(audit_results["Verified Syncs"]))
-        m2.metric("Ghost Overhauls", len(audit_results["Ghost Overhauls"]))
-        m3.metric("Unlogged Maintenance", len(audit_results["Unlogged"]))
-        m4.metric("Quarantine Bay", len(audit_results["Quarantine Bay"]), delta="Requires Review", delta_color="inverse")
+            # 4. Display Results in Tabs
+            tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "✅ Verified Syncs", "👻 Ghost Overhauls", "☣️ Quarantine Bay"])
 
-        # --- The Quarantine Bay View ---
-        st.subheader("☣️ The Quarantine Bay")
-        st.info("Items below could not be matched with 100% confidence. Zero silent failures permitted.")
-        if audit_results["Quarantine Bay"]:
-            st.dataframe(pd.DataFrame(audit_results["Quarantine Bay"]), use_container_width=True)
-        else:
-            st.write("Quarantine Bay is clear.")
+            with tab1:
+                st.subheader("Data Extraction Summary")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("PMS Components Locked", len(pms_df))
+                col2.metric("Raw Log Entries Found", len(tec_data))
+                col3.metric("Items in Quarantine", len(results["Quarantine"]), delta="Requires Review", delta_color="inverse")
+
+            with tab2:
+                st.success("Perfect Semantic & Temporal Matches.")
+                st.dataframe(pd.DataFrame(results["Syncs"]), use_container_width=True)
+
+            with tab3:
+                st.warning("PMS claims an overhaul, but no proof exists in the TEC-19 log.")
+                st.dataframe(pd.DataFrame(results["Ghost"]), use_container_width=True)
+
+            with tab4:
+                st.error("Ambiguous matches or spatial conflicts. Zero silent failures.")
+                if results["Quarantine"]:
+                    st.dataframe(pd.DataFrame(results["Quarantine"]), use_container_width=True)
+                else:
+                    st.write("Quarantine Bay is completely clear.")
+    else:
+        st.info("Awaiting secure document uplink from the sidebar.")
 
 if __name__ == "__main__":
     main()
