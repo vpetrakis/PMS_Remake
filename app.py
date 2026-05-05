@@ -4,6 +4,7 @@ from docx import Document
 import jellyfish
 import re
 import io
+from datetime import datetime
 
 # ==========================================
 # CONSTANTS & CONFIGURATION
@@ -15,194 +16,181 @@ PMS_LOCKED_COLS = ["Component Name", "Last Overhaul Date", "Total Running Hours"
 st.set_page_config(page_title="Temporal Pipeline", layout="wide", initial_sidebar_state="expanded")
 
 # ==========================================
-# PHASE 1 & 2: INTAKE & EXTRACTION STATE MACHINE
+# EXTRACTION LAYER (Supports Multiple Word Docs)
 # ==========================================
 def spatial_lock_pms(excel_bytes):
-    """Securely extract Excel data, enforcing strict header columns."""
     try:
         df = pd.read_excel(excel_bytes, engine='openpyxl')
-        # Normalize column names to avoid trailing space errors
         df.columns = df.columns.str.strip()
-        
-        # Enforce spatial lock
         missing = [col for col in PMS_LOCKED_COLS if col not in df.columns]
-        if missing:
-            return None, f"Spatial Lock Failed. Missing columns: {missing}"
-            
+        if missing: return None, f"Missing columns: {missing}"
         return df[PMS_LOCKED_COLS].dropna(subset=["Component Name"]), None
     except Exception as e:
         return None, f"Excel parsing error: {str(e)}"
 
-def extract_tec19_data(docx_bytes):
-    """
-    Bypasses visual tables. Flattens text, finds date arrays, 
-    and strictly targets the chronological 'Completed' date.
-    """
-    try:
-        doc = Document(io.BytesIO(docx_bytes))
-        extracted_data = []
-        
-        # Flatten all tables into a reliable state-machine format
-        for table in doc.tables:
-            for row in table.rows:
-                # Join cells to prevent merged-cell fragmentation
-                row_text = " ".join([cell.text.strip() for cell in row.cells if cell.text.strip()])
-                
-                # Regex target: DD-MM-YY (e.g., 01-01-26)
-                dates = re.findall(r'\b\d{2}-\d{2}-\d{2}\b', row_text)
-                
-                if dates:
-                    # The actual Job Description is the text excluding the dates
-                    job_desc = re.sub(r'\b\d{2}-\d{2}-\d{2}\b', '', row_text).strip()
-                    # Temporal Anchor: The final date in the sequence is the 'Completed' date
-                    completed_date = dates[-1] 
+def extract_multiple_tec19(uploaded_files):
+    """Processes an unlimited array of uploaded Word documents."""
+    all_extracted_data = []
+    
+    for file in uploaded_files:
+        if file.name.endswith('.doc'):
+            return None, f"Legacy format detected in {file.name}. Please Save As .docx."
+            
+        try:
+            doc = Document(io.BytesIO(file.getvalue()))
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " ".join([cell.text.strip() for cell in row.cells if cell.text.strip()])
+                    dates = re.findall(r'\b\d{2}-\d{2}-\d{2}\b', row_text)
                     
-                    if len(job_desc) > 5: # Filter out empty artifacts
-                        extracted_data.append({
-                            "Text": job_desc,
-                            "Date": completed_date
-                        })
-        return extracted_data, None
-    except Exception as e:
-        return None, f"Word parsing error: {str(e)}"
+                    if dates:
+                        job_desc = re.sub(r'\b\d{2}-\d{2}-\d{2}\b', '', row_text).strip()
+                        completed_date = dates[-1] # Target final date
+                        if len(job_desc) > 5:
+                            all_extracted_data.append({"Text": job_desc, "Date": completed_date, "Source": file.name})
+        except Exception as e:
+            return None, f"Error parsing {file.name}: {str(e)}"
+            
+    return all_extracted_data, None
 
 # ==========================================
-# PHASE 3: VECTORIZED NLP & SHIELD
+# NLP & MATH LOGIC
 # ==========================================
 def apply_weighted_shield(text: str) -> bool:
-    """Action words mathematically overpower inspection words."""
     upper_text = text.upper()
     if any(action in upper_text for action in ACTION_WORDS): return True
     if any(insp in upper_text for insp in INSPECTION_WORDS): return False
     return False
 
 def generate_phonetic_hash(text: str) -> set:
-    """Converts strings to alphanumeric Metaphone sets."""
     clean = re.sub(r'[^A-Z0-9\s]', '', str(text).upper())
     return set(jellyfish.metaphone(word) for word in clean.split() if len(word) > 2)
 
-# ==========================================
-# PHASE 4: THE RECONCILIATION ENGINE
-# ==========================================
-def run_audit(pms_df, tec_data):
-    """Cross-references hashes and routes to isolated data buckets."""
-    results = {"Syncs": [], "Ghosts": [], "Unlogged": [], "Quarantine": []}
+def parse_date(date_str):
+    """Safely converts DD-MM-YY to a workable datetime object."""
+    try:
+        return datetime.strptime(date_str, "%d-%m-%y")
+    except:
+        return None
+
+def run_audit(pms_df, tec_data, audit_date):
+    results = {"Syncs": [], "Ghosts": [], "Unlogged_Hours": [], "Quarantine": []}
     
-    # 1. Filter and Pre-Hash TEC-19 (Vectorization for speed)
-    filtered_tec = []
-    for log in tec_data:
-        if apply_weighted_shield(log["Text"]):
-            filtered_tec.append({
-                "Text": log["Text"],
-                "Date": log["Date"],
-                "Hashes": generate_phonetic_hash(log["Text"])
-            })
+    # Pre-Hash Valid TEC-19 Entries
+    filtered_tec = [log for log in tec_data if apply_weighted_shield(log["Text"])]
+    for log in filtered_tec:
+        log["Hashes"] = generate_phonetic_hash(log["Text"])
+        log["ParsedDate"] = parse_date(log["Date"])
 
-    if not filtered_tec:
-        results["Quarantine"].append({"System Alert": "No valid action entries survived the Anti-Inspection Shield."})
-        return results
-
-    # 2. Iterate PMS and cross-reference
     for _, row in pms_df.iterrows():
         pms_comp = str(row['Component Name'])
-        pms_date = str(row['Last Overhaul Date'])
-        pms_hashes = generate_phonetic_hash(pms_comp)
+        pms_date_str = str(row['Last Overhaul Date'])
         
+        # Safe extraction of running hours
+        try:
+            pms_hours = float(row['Total Running Hours'])
+        except:
+            pms_hours = 0.0
+
+        pms_hashes = generate_phonetic_hash(pms_comp)
+        if not pms_hashes: continue
+            
         match_found = False
         
-        if not pms_hashes:
-            continue
-            
         for log in filtered_tec:
             intersection = pms_hashes.intersection(log["Hashes"])
+            if not pms_hashes: continue
             hash_score = len(intersection) / len(pms_hashes)
             
-            # High Confidence Semantic Match (Adjustable tolerance)
+            # If Semantic Match is Strong (Over 40% Token Intersection)
             if hash_score > 0.4: 
                 match_found = True
                 
-                # Check Temporal Proximity (Exact match for this demonstration)
-                if log["Date"] == pms_date:
-                    results["Syncs"].append({"Component": pms_comp, "PMS Date": pms_date, "TEC Proof": log["Text"]})
+                # MATHEMATICAL TRAP: Check Running Hours
+                if log["ParsedDate"]:
+                    days_since_overhaul = (audit_date - log["ParsedDate"]).days
+                    max_possible_hours = max(days_since_overhaul * 24, 0)
+                    
+                    if pms_hours > max_possible_hours:
+                        results["Unlogged_Hours"].append({
+                            "Component": pms_comp,
+                            "TEC Date": log["Date"],
+                            "PMS Hours Claim": pms_hours,
+                            "Max Physics Allowed": max_possible_hours,
+                            "Status": "CRITICAL: Hours not reset after overhaul."
+                        })
+                        break # Trap triggered, route to Unlogged
+
+                # Temporal Check
+                if log["Date"] == pms_date_str:
+                    results["Syncs"].append({"Component": pms_comp, "Date": pms_date_str, "Proof": log["Text"]})
                 else:
                     results["Quarantine"].append({
                         "Component": pms_comp,
-                        "Conflict": f"Date Mismatch. PMS claims {pms_date}, but TEC-19 shows {log['Date']}.",
-                        "TEC Proof": log["Text"]
+                        "Conflict": f"Date Mismatch. PMS: {pms_date_str} vs TEC: {log['Date']}.",
                     })
-                break # Move to next PMS component
+                break
                 
         if not match_found:
-            results["Ghosts"].append({"Component": pms_comp, "Claimed Date": pms_date, "Status": "No TEC-19 Evidence Found"})
+            results["Ghosts"].append({"Component": pms_comp, "Claimed Date": pms_date_str})
 
     return results
 
 # ==========================================
-# PHASE 5: FRONTEND UI & SANDBOXING
+# FRONTEND UI
 # ==========================================
 def main():
-    # Initialize Session State to prevent memory leaks on UI re-renders
-    if "audit_results" not in st.session_state:
-        st.session_state.audit_results = None
+    if "audit_results" not in st.session_state: st.session_state.audit_results = None
 
     with st.sidebar:
         st.title("⚓ Temporal Zero-Trust Pipeline")
-        st.markdown("Upload files to execute the cross-reference.")
         st.divider()
+        audit_date = st.date_input("Select Date of Audit (For Hour Math)")
         pms_file = st.file_uploader("1. Master PMS (Excel)", type=['xlsx'])
-        tec_file = st.file_uploader("2. TEC-19 Log (Word)", type=['docx']) # Notice .doc is blocked natively
         
-        if st.button("▶ Initialize Audit Engine", use_container_width=True, type="primary"):
-            if not pms_file or not tec_file:
-                st.error("Both files required.")
-                st.stop()
-            
-            # The Intake Gatekeeper: Explicitly block old .doc files
-            if tec_file.name.endswith('.doc'):
-                st.error("🚨 Legacy .doc format detected. Please open the file in Word, 'Save As' .docx, and re-upload. This guarantees 100% data integrity.")
+        # Upgraded to accept multiple files
+        tec_files = st.file_uploader("2. TEC-19 Logs (Word)", type=['docx'], accept_multiple_files=True) 
+        
+        if st.button("▶ Run Audit Engine", type="primary"):
+            if not pms_file or not tec_files:
+                st.error("Both datasets required.")
                 st.stop()
 
-            with st.spinner("Locking coordinates and processing NLP..."):
-                # Run Extraction
+            with st.spinner("Locking coordinates and calculating temporal limits..."):
                 pms_df, pms_error = spatial_lock_pms(pms_file.getvalue())
-                tec_data, tec_error = extract_tec19_data(tec_file.getvalue())
+                tec_data, tec_error = extract_multiple_tec19(tec_files)
 
-                # Halt on Extraction Failure
                 if pms_error: st.error(pms_error); st.stop()
                 if tec_error: st.error(tec_error); st.stop()
-                if not tec_data: st.error("No chronological tables found in Word document."); st.stop()
 
-                # Run Reconciler and cache to session state
-                st.session_state.audit_results = run_audit(pms_df, tec_data)
-                st.success("Audit Complete. Data Cached.")
+                # Execute Math
+                st.session_state.audit_results = run_audit(pms_df, tec_data, datetime.combine(audit_date, datetime.min.time()))
+                st.success("Audit Complete.")
 
-    # Dashboard Rendering
     st.title("Reconciliation Dashboard")
     
     if st.session_state.audit_results:
         res = st.session_state.audit_results
-        
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "✅ Verified Syncs", "👻 Ghost Overhauls", "☣️ Quarantine Bay"])
+        t1, t2, t3, t4 = st.tabs(["📊 Overview", "🚨 Overhaul Hour Traps", "👻 Ghost Overhauls", "☣️ Quarantine / Syncs"])
 
-        with tab1:
-            st.subheader("System Architecture Status")
-            col1, col2 = st.columns(2)
-            col1.metric("Verified Syncs", len(res["Syncs"]))
-            col2.metric("Items in Quarantine", len(res["Quarantine"]), delta="Requires Human Review", delta_color="inverse")
-            st.info("The NLP Engine has successfully hashed and mapped all documentation. Navigate the tabs to review the isolated data buckets.")
+        with t1:
+            st.metric("Total Components Analyzed", len(res["Syncs"]) + len(res["Ghosts"]) + len(res["Unlogged_Hours"]) + len(res["Quarantine"]))
+            
+        with t2:
+            st.error("Components were overhauled, but the PMS hours physically exceed the time elapsed. Counter was not reset.")
+            st.dataframe(pd.DataFrame(res["Unlogged_Hours"]), use_container_width=True)
 
-        with tab2:
-            st.dataframe(pd.DataFrame(res["Syncs"]), use_container_width=True)
-
-        with tab3:
-            st.warning("PMS claims an overhaul, but no corresponding action was found in the TEC-19 log.")
+        with t3:
+            st.warning("Expected with partial data. PMS claims overhaul, but no TEC-19 proof uploaded yet.")
             st.dataframe(pd.DataFrame(res["Ghosts"]), use_container_width=True)
 
-        with tab4:
-            st.error("Date conflicts or ambiguous semantic matches. Zero silent failures permitted.")
+        with t4:
+            st.write("**Quarantine Bay (Conflicts):**")
             st.dataframe(pd.DataFrame(res["Quarantine"]), use_container_width=True)
+            st.write("**Verified Syncs:**")
+            st.dataframe(pd.DataFrame(res["Syncs"]), use_container_width=True)
     else:
-        st.info("Awaiting Uplink. Please upload the Excel PMS and the .docx converted TEC-19 file in the sidebar.")
+        st.info("Awaiting Uplink.")
 
 if __name__ == "__main__":
     main()
