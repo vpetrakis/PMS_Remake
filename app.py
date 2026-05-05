@@ -1,234 +1,244 @@
-import io
-import re
-import shutil
-import subprocess
-import tempfile
-import os
-from datetime import datetime
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import jellyfish
+import os
+import tempfile
+import subprocess
+import shutil
+import json
+from datetime import datetime
 from docx import Document
+import google.generativeai as genai
 
-st.set_page_config(page_title='POSEIDON Parser Workbench', layout='wide', initial_sidebar_state='expanded')
+# ==========================================
+# 1. CORE CONFIGURATION
+# ==========================================
+st.set_page_config(page_title="Temporal Pipeline | AI Edition", layout="wide")
 
-MONTHS = 'JANUARY|FEBRUARY|MARCH|APRIL|MAY|JUNE|JULY|AUGUST|SEPTEMBER|OCTOBER|NOVEMBER|DECEMBER'
-ALIASES = {
-    'M.E.': 'MAIN ENGINE',
-    'ME': 'MAIN ENGINE',
-    'DG': 'DIESEL GENERATOR',
-    'AIR COND.': 'AIR CONDITION',
-    'AIR CONDITIONED': 'AIR CONDITION',
-    'COMP.': 'COMPRESSOR',
-    'L.O.': 'LUBE OIL',
-    'F.O.': 'FUEL OIL',
-    'EXH.': 'EXHAUST',
-    'TC': 'TURBOCHARGER',
-}
+PMS_LOCKED_COLS = ["Component Name", "Last Overhaul Date", "Total Running Hours"]
 
+# ==========================================
+# 2. FILE EXTRACTION (Getting the raw text)
+# ==========================================
+def extract_legacy_doc(file_bytes) -> str:
+    """Uses OS-level 'antiword' to shatter 1997-2003 binary files into raw text."""
+    if not shutil.which('antiword'):
+        raise Exception("CRITICAL: 'antiword' is not installed. Check packages.txt.")
 
-def normalize_text(text: str) -> str:
-    t = (text or '').upper().strip()
-    for k, v in sorted(ALIASES.items(), key=lambda x: len(x[0]), reverse=True):
-        t = re.sub(rf'\b{re.escape(k)}\b', v, t)
-    t = re.sub(r'[^A-Z0-9\s\-\./]', ' ', t)
-    t = re.sub(r'\s+', ' ', t).strip()
-    return t
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.doc') as temp_file:
+        temp_file.write(file_bytes)
+        temp_path = temp_file.name
 
+    try:
+        result = subprocess.run(['antiword', temp_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        text = result.stdout.decode('utf-8', errors='ignore')
+        if result.returncode != 0:
+            raise Exception(result.stderr.decode('utf-8', errors='ignore'))
+        return text
+    finally:
+        os.remove(temp_path)
 
-def extract_word_text(uploaded_file):
-    name = uploaded_file.name.lower()
-    raw = uploaded_file.getvalue()
-    if name.endswith('.docx'):
-        doc = Document(io.BytesIO(raw))
-        parts = []
-        for table in doc.tables:
-            for row in table.rows:
-                vals = [c.text.strip() for c in row.cells if c.text.strip()]
-                if vals:
-                    parts.append(' | '.join(vals))
-        for p in doc.paragraphs:
-            if p.text.strip():
-                parts.append(p.text.strip())
-        return '\n'.join(parts), None
-    if name.endswith('.doc'):
-        antiword = shutil.which('antiword')
-        if not antiword:
-            return None, 'antiword is not installed; .doc parsing unavailable in this environment'
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.doc') as tmp:
-            tmp.write(raw)
-            tmp_path = tmp.name
-        try:
-            proc = subprocess.run([antiword, tmp_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if proc.returncode != 0:
-                return None, proc.stderr.decode('utf-8', errors='ignore') or 'antiword failed'
-            return proc.stdout.decode('utf-8', errors='ignore'), None
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-    return None, 'Unsupported file type'
+def extract_modern_docx(file_bytes) -> str:
+    """Extracts text from modern XML Word files."""
+    doc = Document(io.BytesIO(file_bytes))
+    return "\n".join([para.text.strip() for para in doc.paragraphs if para.text.strip()])
 
+# ==========================================
+# 3. THE LLM STRUCTURING ENGINE (Pathway B)
+# ==========================================
+def parse_text_with_llm(raw_text: str, api_key: str) -> list:
+    """Uses AI to intelligently extract overhauls and format them as JSON."""
+    genai.configure(api_key=api_key)
+    # Using Gemini 1.5 Flash for high-speed, high-accuracy text extraction
+    model = genai.GenerativeModel('gemini-1.5-flash')
+    
+    prompt = f"""
+    You are an expert maritime auditor. Analyze the following daily logbook text.
+    Your objective is to find ONLY major maintenance events (OVERHAUL, RENEW, REPLACE, CHANGE).
+    Strictly IGNORE routine checks (CHECK, INSPECT, CLEAN, TEST, MEASURE).
+    
+    Output the data as a strict, valid JSON array of objects with exactly two keys: "Component" and "Date".
+    Format the Date as "DD-MM-YY" (find the 'Completed' date if multiple exist).
+    If no major events are found, return an empty array [].
+    
+    Logbook Text:
+    {raw_text}
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        # Strip markdown formatting to parse JSON safely
+        json_string = response.text.replace("```json", "").replace("
+```", "").strip()
+        return json.loads(json_string)
+    except Exception as e:
+        st.error(f"LLM Extraction Failed: {str(e)}")
+        return []
 
-def split_tec_segments(text: str):
-    t = re.sub(r'\s+', ' ', text)
-    t = re.sub(rf'({MONTHS}(?:\s+\d{{4}})?)', r'\n\1', t)
-    t = re.sub(r'(WEEK\s+\d+)', r'\n\1', t)
-    t = re.sub(r'(?<!\d)(\d{1,3})(?=[A-Z])', r'\n\1', t)
-    return [x.strip() for x in t.split('\n') if x.strip()]
+def spatial_lock_pms(excel_bytes) -> tuple:
+    try:
+        df = pd.read_excel(excel_bytes, engine='openpyxl')
+        df.columns = df.columns.str.strip()
+        missing = [col for col in PMS_LOCKED_COLS if col not in df.columns]
+        if missing: return None, f"Missing columns: {missing}"
+        return df[PMS_LOCKED_COLS].dropna(subset=["Component Name"]), None
+    except Exception as e:
+        return None, f"Excel error: {str(e)}"
 
+# ==========================================
+# 4. VECTORIZED NLP & ZERO-TRUST MATH
+# ==========================================
+def generate_phonetic_hash(text: str) -> set:
+    clean = ''.join(e for e in str(text).upper() if e.isalnum() or e.isspace())
+    return set(jellyfish.metaphone(word) for word in clean.split() if len(word) > 2)
 
-def parse_tec_file(uploaded_file, vessel_name: str):
-    raw_text, err = extract_word_text(uploaded_file)
-    if err:
-        return pd.DataFrame(), pd.DataFrame([{'source_file': uploaded_file.name, 'reason': err}]), raw_text or ''
+def parse_date_safely(date_str: str):
+    try:
+        # Handles various 2-digit year formats
+        return datetime.strptime(date_str, "%d-%m-%y")
+    except:
+        return None
 
-    month = None
-    week = None
-    rows = []
-    quarantine = []
-    for seg in split_tec_segments(raw_text):
-        if re.match(rf'^{MONTHS}', seg):
-            month = seg
-            continue
-        m_week = re.match(r'^WEEK\s+(\d+)', seg)
-        if m_week:
-            week = int(m_week.group(1))
-            continue
-        dates = re.findall(r'\d{2}-\d{2}-\d{2}', seg)
-        clean = re.sub(r'\d{2}-\d{2}-\d{2}', ' ', seg)
-        clean = re.sub(r'\bCE\b', ' ', clean, flags=re.I)
-        clean = re.sub(r'\s+', ' ', clean).strip()
-        norm = normalize_text(clean)
-        if len(norm) < 5:
-            quarantine.append({'source_file': uploaded_file.name, 'raw_segment': seg, 'reason': 'too_short'})
-            continue
-        rows.append({
-            'vessel_name': vessel_name,
-            'source_file': uploaded_file.name,
-            'source_month': month,
-            'week_no': week,
-            'raw_segment': seg,
-            'clean_text': clean,
-            'normalized_text': norm,
-            'date_count': len(dates),
-            'dates_found': ' | '.join(dates),
-            'segment_type': 'SCHEDULED' if dates else 'EXECUTED_OR_FREE_TEXT'
-        })
-    return pd.DataFrame(rows), pd.DataFrame(quarantine), raw_text
+def run_audit(pms_df, tec_json_data, audit_date):
+    """Cross-references the AI's JSON against the Excel Math."""
+    results = {"Syncs": [], "Ghosts": [], "Unlogged_Hours": [], "Quarantine": []}
+    
+    # Pre-hash TEC entries
+    for log in tec_json_data:
+        log["Hashes"] = generate_phonetic_hash(log.get("Component", ""))
+        log["ParsedDate"] = parse_date_safely(log.get("Date", ""))
 
+    if not tec_json_data:
+        results["Quarantine"].append({"System Alert": "The AI found no major overhauls in the uploaded logbooks."})
+        return results
 
-def parse_pms_file(uploaded_file, vessel_name: str):
-    name = uploaded_file.name.lower()
-    if name.endswith(('.xlsx', '.xls')):
-        df = pd.read_excel(uploaded_file, engine='openpyxl' if name.endswith('.xlsx') else None)
-        df.columns = [str(c).strip() for c in df.columns]
-        preview = df.copy()
-        if len(preview.columns) > 0:
-            preview['__row_text__'] = preview.astype(str).agg(' | '.join, axis=1)
-            preview['__normalized__'] = preview['__row_text__'].map(normalize_text)
-        quarantine = pd.DataFrame()
-        return preview, quarantine, 'SPREADSHEET MODE'
+    # Scan PMS Ledger
+    for _, row in pms_df.iterrows():
+        pms_comp = str(row['Component Name'])
+        pms_date_str = str(row['Last Overhaul Date'])
+        
+        try: pms_hours = float(row['Total Running Hours'])
+        except: pms_hours = 0.0
 
-    raw_text, err = extract_word_text(uploaded_file)
-    if err:
-        return pd.DataFrame(), pd.DataFrame([{'source_file': uploaded_file.name, 'reason': err}]), raw_text or ''
+        pms_hashes = generate_phonetic_hash(pms_comp)
+        if not pms_hashes: continue
+            
+        match_found = False
+        
+        for log in tec_json_data:
+            intersection = pms_hashes.intersection(log["Hashes"])
+            if not pms_hashes: continue
+            hash_score = len(intersection) / len(pms_hashes)
+            
+            # Semantic Match (40% Phonetic Confidence)
+            if hash_score > 0.4: 
+                match_found = True
+                
+                # Goal 3 Math Trap: Physical Hours Allowed
+                if log["ParsedDate"]:
+                    days_since_overhaul = (audit_date - log["ParsedDate"]).days
+                    max_possible_hours = max(days_since_overhaul * 24, 0)
+                    
+                    if pms_hours > max_possible_hours:
+                        results["Unlogged_Hours"].append({
+                            "Component": pms_comp,
+                            "TEC Date": log["Date"],
+                            "PMS Hours": pms_hours,
+                            "Max Allowed": max_possible_hours,
+                            "Status": "CRITICAL: Counter not reset."
+                        })
+                        break
 
-    txt = re.sub(r'\s+', ' ', raw_text)
-    sections = []
-    headings = ['MAIN ENGINE', 'TURBOCHARGER', 'COOLERS', 'AC REFR. COMPRESSORS', 'AUXILIARY BOILER', 'EXH GAS BOILER', 'MAIN AIR COMPRESSORS', 'AUX. ENGINE']
-    for h in headings:
-        if h in txt.upper():
-            sections.append(h)
+                # Temporal Check
+                if log["Date"] == pms_date_str:
+                    results["Syncs"].append({"Component": pms_comp, "Sync Date": pms_date_str, "TEC Proof": log["Component"]})
+                else:
+                    results["Quarantine"].append({
+                        "Component": pms_comp,
+                        "Conflict": f"Date Mismatch. PMS Claims {pms_date_str}, TEC Claims {log['Date']}.",
+                        "TEC Proof": log["Component"]
+                    })
+                break 
+                
+        if not match_found:
+            results["Ghosts"].append({"Component": pms_comp, "PMS Date": pms_date_str, "Status": "No TEC Evidence"})
 
-    blocks = []
-    for h in sections:
-        idx = txt.upper().find(h)
-        snippet = txt[idx: idx + 1000] if idx >= 0 else ''
-        blocks.append({'section_name': h, 'raw_excerpt': snippet, 'normalized_excerpt': normalize_text(snippet)})
+    return results
 
-    quarantine = pd.DataFrame()
-    if not blocks:
-        quarantine = pd.DataFrame([{'source_file': uploaded_file.name, 'reason': 'no_known_sections_detected'}])
-    return pd.DataFrame(blocks), quarantine, raw_text
+# ==========================================
+# 5. FRONTEND UI
+# ==========================================
+def main():
+    if "audit_results" not in st.session_state: st.session_state.audit_results = None
 
+    with st.sidebar:
+        st.title("⚓ AI Temporal Pipeline")
+        api_key = st.text_input("Enter Gemini API Key", type="password", help="Required to parse unstructured .doc files.")
+        st.divider()
+        audit_date = st.date_input("Select Date of Audit (For Physical Limits Math)")
+        
+        pms_file = st.file_uploader("1. Master PMS Ledger (Excel)", type=['xlsx', 'xls'])
+        tec_files = st.file_uploader("2. TEC-19 Logs (Word)", type=['doc', 'docx'], accept_multiple_files=True) 
+        
+        if st.button("▶ Execute AI Audit", type="primary", use_container_width=True):
+            if not api_key:
+                st.error("🚨 API Key required for AI text structuring.")
+                st.stop()
+            if not pms_file or not tec_files:
+                st.error("🚨 Both datasets are required.")
+                st.stop()
 
-st.title('POSEIDON Parser Workbench')
-st.caption('Revised parser-first build: stable ingestion, extraction visibility, and quarantine before matching.')
+            with st.spinner("Shattering binaries, structuring text with AI, and auditing timelines..."):
+                # Phase 1: Spatial Lock
+                pms_df, pms_error = spatial_lock_pms(pms_file.getvalue())
+                if pms_error: st.error(pms_error); st.stop()
 
-with st.sidebar:
-    st.header('Inputs')
-    vessel_name = st.text_input('Vessel name', value='MV ALEXIS')
-    pms_file = st.file_uploader('PMS / Running Hours (.doc, .docx, .xlsx, .xls)', type=['doc', 'docx', 'xlsx', 'xls'])
-    tec_files = st.file_uploader('TEC Logs (.doc, .docx)', type=['doc', 'docx'], accept_multiple_files=True)
-    run_btn = st.button('Parse files', type='primary', use_container_width=True)
+                # Phase 2: Extract & Structure via LLM
+                all_tec_json = []
+                for file in tec_files:
+                    if file.name.lower().endswith('.doc'):
+                        raw_text = extract_legacy_doc(file.getvalue())
+                    else:
+                        raw_text = extract_modern_docx(file.getvalue())
+                    
+                    structured_data = parse_text_with_llm(raw_text, api_key)
+                    all_tec_json.extend(structured_data)
 
-if not run_btn:
-    st.info('Upload files and run the parser workbench. This version intentionally stops before fuzzy matching and forensic scoring.')
-    st.stop()
+                if not all_tec_json: 
+                    st.error("🚨 Extraction Halted: The AI could not find any major overhauls in the provided documents.")
+                    st.stop()
 
-if not pms_file and not tec_files:
-    st.error('Upload at least one PMS file or one TEC file.')
-    st.stop()
+                # Phase 3 & 4: Execute Zero-Trust Math
+                dt_audit = datetime.combine(audit_date, datetime.min.time())
+                st.session_state.audit_results = run_audit(pms_df, all_tec_json, dt_audit)
+                st.success("Audit Complete.")
 
-pms_df, pms_q, pms_raw = pd.DataFrame(), pd.DataFrame(), ''
-if pms_file:
-    pms_df, pms_q, pms_raw = parse_pms_file(pms_file, vessel_name)
+    # Dashboard Rendering
+    st.title("Reconciliation Dashboard")
+    
+    if st.session_state.audit_results:
+        res = st.session_state.audit_results
+        t1, t2, t3, t4 = st.tabs(["📊 Overview", "🚨 Running Hours Traps", "👻 Ghost Overhauls", "☣️ Quarantine / Syncs"])
 
-tec_frames = []
-tec_q_frames = []
-tec_raw_bundle = []
-for f in tec_files or []:
-    df, q, raw = parse_tec_file(f, vessel_name)
-    tec_frames.append(df)
-    tec_q_frames.append(q)
-    tec_raw_bundle.append({'file_name': f.name, 'raw_text': raw[:15000]})
+        with t1:
+            total_processed = len(res["Syncs"]) + len(res["Ghosts"]) + len(res["Unlogged_Hours"]) + len(res["Quarantine"])
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Total Components Analyzed", total_processed)
+            m2.metric("Verified Syncs", len(res["Syncs"]))
+            m3.metric("Falsified Hours", len(res["Unlogged_Hours"]), delta="High Risk", delta_color="inverse")
+            m4.metric("Quarantine Bay", len(res["Quarantine"]), delta="Requires Review", delta_color="inverse")
 
-tec_df = pd.concat(tec_frames, ignore_index=True) if tec_frames else pd.DataFrame()
-tec_q = pd.concat(tec_q_frames, ignore_index=True) if tec_q_frames else pd.DataFrame()
+        with t2:
+            st.dataframe(pd.DataFrame(res["Unlogged_Hours"]), use_container_width=True)
+        with t3:
+            st.dataframe(pd.DataFrame(res["Ghosts"]), use_container_width=True)
+        with t4:
+            st.write("### ☣️ The Quarantine Bay")
+            st.dataframe(pd.DataFrame(res["Quarantine"]), use_container_width=True)
+            st.write("### ✅ Verified Syncs")
+            st.dataframe(pd.DataFrame(res["Syncs"]), use_container_width=True)
+    else:
+        st.info("Awaiting Uplink. Enter your API key and upload files to begin.")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric('PMS parsed rows', len(pms_df))
-c2.metric('PMS quarantine', len(pms_q))
-c3.metric('TEC parsed rows', len(tec_df))
-c4.metric('TEC quarantine', len(tec_q))
-
-tabs = st.tabs(['Overview', 'PMS Parsed', 'PMS Quarantine', 'TEC Parsed', 'TEC Quarantine', 'Raw Text'])
-
-with tabs[0]:
-    st.subheader('Parser summary')
-    st.dataframe(pd.DataFrame([{
-        'timestamp': datetime.now().isoformat(timespec='seconds'),
-        'vessel_name': vessel_name,
-        'pms_file': pms_file.name if pms_file else None,
-        'tec_files': ', '.join([f.name for f in tec_files]) if tec_files else None,
-        'pms_rows': len(pms_df),
-        'pms_quarantine': len(pms_q),
-        'tec_rows': len(tec_df),
-        'tec_quarantine': len(tec_q),
-    }]), use_container_width=True)
-    st.markdown('This build is intentionally conservative: it only proves ingestion and extraction quality before any matching logic is reintroduced.')
-
-with tabs[1]:
-    st.subheader('PMS parsed output')
-    st.dataframe(pms_df, use_container_width=True, height=520)
-
-with tabs[2]:
-    st.subheader('PMS quarantine')
-    st.dataframe(pms_q, use_container_width=True, height=520)
-
-with tabs[3]:
-    st.subheader('TEC parsed output')
-    st.dataframe(tec_df, use_container_width=True, height=520)
-
-with tabs[4]:
-    st.subheader('TEC quarantine')
-    st.dataframe(tec_q, use_container_width=True, height=520)
-
-with tabs[5]:
-    st.subheader('Raw text inspection')
-    if pms_file:
-        st.markdown(f'### PMS raw text: {pms_file.name}')
-        st.text_area('PMS raw', pms_raw[:20000], height=250)
-    for item in tec_raw_bundle:
-        st.markdown(f"### TEC raw text: {item['file_name']}")
-        st.text_area(item['file_name'], item['raw_text'], height=250)
+if __name__ == "__main__":
+    main()
