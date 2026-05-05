@@ -20,7 +20,7 @@ INSPECTION_WORDS = {"CHECK", "INSPECT", "INSP", "CLEAN", "TEST", "MEASURE"}
 PMS_LOCKED_COLS = ["Component Name", "Last Overhaul Date", "Total Running Hours"]
 
 # ==========================================
-# 2. LOCAL FILE EXTRACTION ENGINE
+# 2. LOCAL FILE EXTRACTION ENGINE (WORD)
 # ==========================================
 def extract_legacy_doc(file_bytes) -> str:
     """Uses Linux OS-level 'antiword' to crack 1997-2003 binary files into raw text."""
@@ -51,21 +51,18 @@ def process_tec19_files(uploaded_files) -> list:
     
     for file in uploaded_files:
         try:
-            # Route based on extension
             if file.name.lower().endswith('.doc'):
                 raw_text = extract_legacy_doc(file.getvalue())
             else:
                 raw_text = extract_modern_docx(file.getvalue())
             
-            # Read line by line, looking for chronological anchors
             for line in raw_text.split('\n'):
                 line = line.strip()
                 dates = re.findall(r'\b\d{2}-\d{2}-\d{2}\b', line)
                 
                 if dates:
-                    # Remove the dates from the string to isolate the component/job
                     job_desc = re.sub(r'\b\d{2}-\d{2}-\d{2}\b', '', line).strip()
-                    completed_date = dates[-1] # The final date in the sequence
+                    completed_date = dates[-1] 
                     
                     if len(job_desc) > 5:
                         all_extracted_data.append({
@@ -78,22 +75,52 @@ def process_tec19_files(uploaded_files) -> list:
             
     return all_extracted_data
 
+# ==========================================
+# 3. INTELLIGENT EXCEL HUNTER
+# ==========================================
 def spatial_lock_pms(excel_bytes) -> tuple:
-    """Strict Header Enforcement for Excel. Now wrapped safely in io.BytesIO"""
+    """Finds headers dynamically, maps alternative column names, and fixes the bytes error."""
     try:
-        # THE FIX: excel_bytes is wrapped so Pandas can read it from memory
-        df = pd.read_excel(io.BytesIO(excel_bytes), engine='openpyxl')
-        df.columns = df.columns.str.strip()
+        # 1. Read blindly to hunt for the starting row (Using io.BytesIO to fix the bytes error)
+        df_raw = pd.read_excel(io.BytesIO(excel_bytes), engine='openpyxl', header=None)
         
-        missing = [col for col in PMS_LOCKED_COLS if col not in df.columns]
-        if missing: return None, f"Missing exact columns: {missing}"
+        header_idx = 0
+        for idx, row in df_raw.head(20).iterrows():
+            row_text = " ".join(str(val).upper() for val in row.values)
+            # Hunt for keywords that prove we found the header row
+            if "COMPONENT" in row_text or "OVERHAUL" in row_text or "DATE" in row_text:
+                header_idx = idx
+                break
+                
+        # 2. Re-read the file locking onto the correct header row
+        df = pd.read_excel(io.BytesIO(excel_bytes), engine='openpyxl', header=header_idx)
+        
+        # Normalize the column names to uppercase for easy matching
+        df.columns = df.columns.astype(str).str.strip().str.upper()
+        
+        # 3. Flexible Mapping for alternative PMS software outputs
+        target_cols = {}
+        for col in df.columns:
+            if "COMPONENT" in col or "DESCRIPTION" in col or "EQUIPMENT" in col or "NAME" in col:
+                target_cols["Component Name"] = col
+            elif "OVERHAUL" in col or "DATE" in col or "LAST" in col:
+                target_cols["Last Overhaul Date"] = col
+            elif "HOUR" in col or "HRS" in col or "RUN" in col:
+                target_cols["Total Running Hours"] = col
+                
+        if len(target_cols) < 3:
+            return None, f"Could not map the required columns. Found these headers instead: {list(df.columns)}"
+            
+        # 4. Rename the ship's specific columns to match our Engine's locked variables
+        df = df.rename(columns={v: k for k, v in target_cols.items()})
         
         return df[PMS_LOCKED_COLS].dropna(subset=["Component Name"]), None
+        
     except Exception as e:
-        return None, f"Excel parsing error: {str(e)}"
+        return None, f"Fatal Excel extraction error: {str(e)}"
 
 # ==========================================
-# 3. VECTORIZED NLP & ZERO-TRUST MATH
+# 4. VECTORIZED NLP & ZERO-TRUST MATH
 # ==========================================
 def apply_weighted_shield(text: str) -> bool:
     upper_text = str(text).upper()
@@ -106,16 +133,12 @@ def generate_phonetic_hash(text: str) -> set:
     return set(jellyfish.metaphone(word) for word in clean.split() if len(word) > 2)
 
 def parse_date_safely(date_str: str):
-    try:
-        return datetime.strptime(date_str, "%d-%m-%y")
-    except:
-        return None
+    try: return datetime.strptime(date_str, "%d-%m-%y")
+    except: return None
 
 def run_audit(pms_df, tec_data, audit_date):
-    """The Core Cross-Reference Engine."""
     results = {"Syncs": [], "Ghosts": [], "Unlogged_Hours": [], "Quarantine": []}
     
-    # Pre-hash TEC entries for speed
     filtered_tec = [log for log in tec_data if apply_weighted_shield(log["Text"])]
     for log in filtered_tec:
         log["Hashes"] = generate_phonetic_hash(log["Text"])
@@ -125,7 +148,6 @@ def run_audit(pms_df, tec_data, audit_date):
         results["Quarantine"].append({"System Alert": "No valid action entries survived the Anti-Inspection Shield."})
         return results
 
-    # Scan PMS Ledger
     for _, row in pms_df.iterrows():
         pms_comp = str(row['Component Name'])
         pms_date_str = str(row['Last Overhaul Date'])
@@ -143,11 +165,9 @@ def run_audit(pms_df, tec_data, audit_date):
             if not pms_hashes: continue
             hash_score = len(intersection) / len(pms_hashes)
             
-            # Semantic Match (40% Phonetic Confidence)
             if hash_score > 0.4: 
                 match_found = True
                 
-                # Math Trap: Physical Hours Allowed
                 if log["ParsedDate"]:
                     days_since_overhaul = (audit_date - log["ParsedDate"]).days
                     max_possible_hours = max(days_since_overhaul * 24, 0)
@@ -162,7 +182,6 @@ def run_audit(pms_df, tec_data, audit_date):
                         })
                         break
 
-                # Temporal Check
                 if log["Date"] == pms_date_str:
                     results["Syncs"].append({"Component": pms_comp, "Sync Date": pms_date_str, "TEC Proof": log["Text"]})
                 else:
@@ -179,7 +198,7 @@ def run_audit(pms_df, tec_data, audit_date):
     return results
 
 # ==========================================
-# 4. FRONTEND UI & DASHBOARD
+# 5. FRONTEND UI & DASHBOARD
 # ==========================================
 def main():
     if "audit_results" not in st.session_state: st.session_state.audit_results = None
@@ -189,8 +208,7 @@ def main():
         st.divider()
         audit_date = st.date_input("Select Date of Audit (For Physical Limits Math)")
         
-        # Note: If your file is .xls, 'openpyxl' engine might complain. Make sure to upload .xlsx files for PMS.
-        pms_file = st.file_uploader("1. Master PMS Ledger (Excel .xlsx)", type=['xlsx'])
+        pms_file = st.file_uploader("1. Master PMS Ledger (Excel)", type=['xlsx', 'xls'])
         tec_files = st.file_uploader("2. TEC-19 Logs (Word)", type=['doc', 'docx'], accept_multiple_files=True) 
         
         if st.button("▶ Execute Audit", type="primary", use_container_width=True):
@@ -198,7 +216,7 @@ def main():
                 st.error("🚨 Both datasets are required.")
                 st.stop()
 
-            with st.spinner("Cracking binary files and executing Zero-Trust Math..."):
+            with st.spinner("Hunting headers, cracking binaries, and executing Zero-Trust Math..."):
                 pms_df, pms_error = spatial_lock_pms(pms_file.getvalue())
                 if pms_error: st.error(pms_error); st.stop()
 
