@@ -2,10 +2,13 @@ import streamlit as st
 import pandas as pd
 import jellyfish
 import re
+import io
 import os
 import tempfile
 import subprocess
+import shutil
 from datetime import datetime
+from docx import Document
 
 # ==========================================
 # 1. CORE CONFIGURATION
@@ -17,17 +20,20 @@ INSPECTION_WORDS = {"CHECK", "INSPECT", "INSP", "CLEAN", "TEST", "MEASURE"}
 PMS_LOCKED_COLS = ["Component Name", "Last Overhaul Date", "Total Running Hours"]
 
 # ==========================================
-# 2. NATIVE .DOC INTAKE ENGINE
+# 2. DUAL-FORMAT INTAKE ENGINE
 # ==========================================
 def extract_legacy_doc(file_bytes) -> str:
-    """Uses OS-level antiword binary to read 1997-2003 .doc files natively."""
-    # Write the bytes to a secure temporary file
+    """Uses Linux OS-level 'antiword' to shatter 1997-2003 binary files."""
+    if not shutil.which('antiword'):
+        raise Exception("CRITICAL: 'antiword' is not installed on this server. You must add a 'packages.txt' file to your GitHub root containing the word 'antiword'.")
+
+    # Sandbox the binary file
     with tempfile.NamedTemporaryFile(delete=False, suffix='.doc') as temp_file:
         temp_file.write(file_bytes)
         temp_path = temp_file.name
 
     try:
-        # Execute antiword to crack the binary and flatten tables to text
+        # Execute binary extraction
         result = subprocess.run(['antiword', temp_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         text = result.stdout.decode('utf-8', errors='ignore')
         
@@ -36,39 +42,53 @@ def extract_legacy_doc(file_bytes) -> str:
             
         return text
     finally:
-        os.remove(temp_path) # Clean up sandbox
+        os.remove(temp_path) # Terminate sandbox
 
-def extract_tec19_data(uploaded_files) -> tuple:
-    """Parses the raw text extracted from the legacy .doc files."""
+def extract_modern_docx(file_bytes) -> str:
+    """Extracts modern XML-based Word files."""
+    doc = Document(io.BytesIO(file_bytes))
+    raw_text = []
+    for table in doc.tables:
+        for row in table.rows:
+            raw_text.append(" ".join([cell.text.strip() for cell in row.cells if cell.text.strip()]))
+    for para in doc.paragraphs:
+        if para.text.strip(): raw_text.append(para.text.strip())
+    return "\n".join(raw_text)
+
+def process_tec19_files(uploaded_files) -> tuple:
+    """Routes files to correct extractor and applies State-Machine logic."""
     all_extracted_data = []
     
     for file in uploaded_files:
         try:
-            # Native extraction
-            raw_text = extract_legacy_doc(file.getvalue())
+            # Route based on extension
+            if file.name.lower().endswith('.doc'):
+                raw_text = extract_legacy_doc(file.getvalue())
+            else:
+                raw_text = extract_modern_docx(file.getvalue())
             
-            # Read line by line
+            # State-Machine Date Regex Parser
             for line in raw_text.split('\n'):
                 line = line.strip()
                 dates = re.findall(r'\b\d{2}-\d{2}-\d{2}\b', line)
                 
                 if dates:
-                    # Strip dates to leave just the Job Description
                     job_desc = re.sub(r'\b\d{2}-\d{2}-\d{2}\b', '', line).strip()
-                    completed_date = dates[-1] # The chronological anchor
+                    completed_date = dates[-1] # Chronological Anchor
                     
                     if len(job_desc) > 5:
                         all_extracted_data.append({
                             "Text": job_desc,
                             "Date": completed_date,
-                            "Source File": file.name
+                            "Source": file.name
                         })
         except Exception as e:
-            return None, f"Fatal binary parsing error in {file.name}: {str(e)}. Ensure 'antiword' is in packages.txt."
+            return None, f"Fatal parsing error in {file.name}: {str(e)}"
             
     return all_extracted_data, None
 
 def spatial_lock_pms(excel_bytes) -> tuple:
+    """Strict Header Enforcement for Excel."""
     try:
         df = pd.read_excel(excel_bytes, engine='openpyxl')
         df.columns = df.columns.str.strip()
@@ -98,8 +118,10 @@ def parse_date_safely(date_str: str):
         return None
 
 def run_audit(pms_df, tec_data, audit_date):
+    """The Core Zero-Trust Engine."""
     results = {"Syncs": [], "Ghosts": [], "Unlogged_Hours": [], "Quarantine": []}
     
+    # Pre-hash TEC entries
     filtered_tec = [log for log in tec_data if apply_weighted_shield(log["Text"])]
     for log in filtered_tec:
         log["Hashes"] = generate_phonetic_hash(log["Text"])
@@ -109,6 +131,7 @@ def run_audit(pms_df, tec_data, audit_date):
         results["Quarantine"].append({"System Alert": "No valid action entries survived."})
         return results
 
+    # Scan PMS Ledger
     for _, row in pms_df.iterrows():
         pms_comp = str(row['Component Name'])
         pms_date_str = str(row['Last Overhaul Date'])
@@ -128,9 +151,11 @@ def run_audit(pms_df, tec_data, audit_date):
             if not pms_hashes: continue
             hash_score = len(intersection) / len(pms_hashes)
             
+            # Semantic Match (40% Phonetic Confidence)
             if hash_score > 0.4: 
                 match_found = True
                 
+                # Math Trap: Physical Hours Allowed
                 if log["ParsedDate"]:
                     days_since_overhaul = (audit_date - log["ParsedDate"]).days
                     max_possible_hours = max(days_since_overhaul * 24, 0)
@@ -145,6 +170,7 @@ def run_audit(pms_df, tec_data, audit_date):
                         })
                         break
 
+                # Temporal Check
                 if log["Date"] == pms_date_str:
                     results["Syncs"].append({"Component": pms_comp, "Sync Date": pms_date_str, "TEC Proof": log["Text"]})
                 else:
@@ -161,7 +187,7 @@ def run_audit(pms_df, tec_data, audit_date):
     return results
 
 # ==========================================
-# 4. FRONTEND UI
+# 4. FRONTEND UI & SANDBOXING
 # ==========================================
 def main():
     if "audit_results" not in st.session_state: st.session_state.audit_results = None
@@ -170,10 +196,9 @@ def main():
         st.title("⚓ Temporal Zero-Trust Pipeline")
         st.divider()
         audit_date = st.date_input("Select Date of Audit (For Physical Limits Math)")
-        pms_file = st.file_uploader("1. Master PMS Ledger (Excel)", type=['xlsx'])
         
-        # UI Native .doc intake enabled
-        tec_files = st.file_uploader("2. TEC-19 Logs (Word Legacy)", type=['doc'], accept_multiple_files=True) 
+        pms_file = st.file_uploader("1. Master PMS Ledger (Excel)", type=['xlsx', 'xls'])
+        tec_files = st.file_uploader("2. TEC-19 Logs (Word)", type=['doc', 'docx'], accept_multiple_files=True) 
         
         if st.button("▶ Execute Audit", type="primary", use_container_width=True):
             if not pms_file or not tec_files:
@@ -182,7 +207,7 @@ def main():
 
             with st.spinner("Cracking binary files and mapping NLP Hashes..."):
                 pms_df, pms_error = spatial_lock_pms(pms_file.getvalue())
-                tec_data, tec_error = extract_tec19_data(tec_files)
+                tec_data, tec_error = process_tec19_files(tec_files)
 
                 if pms_error: st.error(pms_error); st.stop()
                 if tec_error: st.error(tec_error); st.stop()
@@ -218,7 +243,8 @@ def main():
             st.write("### ✅ Verified Syncs")
             st.dataframe(pd.DataFrame(res["Syncs"]), use_container_width=True)
     else:
-        st.info("Awaiting Uplink.")
+        st.info("Awaiting Uplink. Ensure packages.txt is deployed to Streamlit.")
 
 if __name__ == "__main__":
     main()
+    
