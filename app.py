@@ -148,6 +148,18 @@ def extract_lines_from_word(file_bytes: bytes, filename: str) -> list[str]:
 def parse_tec19_files(uploaded_files: list) -> list[dict]:
     """
     Parse TEC-19 work diary Word documents.
+
+    Key design decision: operate on RAW binary strings (no alphabetic filtering)
+    so that pure-date strings like '31-01-26' (which have 0 alpha chars) are
+    preserved for date-tracking in the state machine.
+
+    Document table structure (per row):
+      Col 1: Job Description  Col 2: Issued  Col 3: Progress  Col 4: Deadline  Col 5: Completed
+    → Raw strings appear as: [description, deadline_date, issued_date, completed_date, completed_date]
+
+    The state machine tracks all dates seen after a description; the LAST date
+    collected before the next description is treated as the completion date.
+
     Returns list of {text, date, normalized_text, is_action, source}
     """
     DATE_PATTERN = re.compile(r'\b(\d{2})[/-](\d{2})[/-](\d{2,4})\b')
@@ -156,83 +168,124 @@ def parse_tec19_files(uploaded_files: list) -> list[dict]:
     for f in uploaded_files:
         try:
             file_bytes = f.getvalue()
-            lines = extract_lines_from_word(file_bytes, f.name)
 
-            if not lines:
-                st.warning(f"⚠️ No readable text extracted from: {f.name}")
+            # ── Extract ALL raw strings, INCLUDING date-only lines ──
+            # This is critical: pure date strings like "06-01-26" have 0 alpha
+            # chars and would be filtered out by any alphabetic content filter.
+            if f.name.lower().endswith('.docx'):
+                try:
+                    doc = Document(io.BytesIO(file_bytes))
+                    raw_lines = [p.text.strip() for p in doc.paragraphs
+                                 if p.text.strip()]
+                    if not raw_lines:
+                        raise ValueError("Empty docx")
+                except Exception:
+                    # Fall back to binary extraction
+                    raw_lines = extract_strings_from_binary(file_bytes, min_length=5)
+            else:
+                # Binary .doc: use string scanning with short minimum to capture dates
+                raw_lines = extract_strings_from_binary(file_bytes, min_length=5)
+
+            if not raw_lines:
+                st.warning(f"⚠️ No text could be extracted from: {f.name}")
                 continue
 
-            # State-machine parser: associate each job description with its nearest date
-            current_date = None
-            job_buffer = []
+            # ── State machine ──
+            # For each job description, collect all dates that follow it.
+            # The last date in the sequence is the completion date.
+            current_job_text = None       # text of the current job being tracked
+            collected_dates: list = []    # all dates seen since last job text
 
-            for line in lines:
-                dates_in_line = DATE_PATTERN.findall(line)
-
-                if dates_in_line:
-                    # Flush buffered job text if we had one
-                    if job_buffer and current_date:
-                        job_text = ' '.join(job_buffer).strip()
-                        if len(job_text) > 8 and is_action_entry(job_text):
-                            all_entries.append({
-                                'text': job_text,
-                                'date': current_date,
-                                'normalized_text': normalize_maritime_text(job_text),
-                                'is_action': True,
-                                'source': f.name,
-                            })
-                    job_buffer = []
-
-                    # Parse and store the date(s) from this line
-                    for d, m, y in dates_in_line:
-                        day, month = int(d), int(m)
-                        year = int(y)
-                        if year < 100:
-                            year += 2000
-                        if 1 <= day <= 31 and 1 <= month <= 12:
-                            try:
-                                current_date = datetime(year, month, day)
-                                break
-                            except ValueError:
-                                continue
-
-                    # The line itself might also contain a job description (minus the date)
-                    job_part = DATE_PATTERN.sub('', line).strip()
-                    if len(job_part) > 8 and sum(c.isalpha() for c in job_part) > 4:
-                        job_buffer.append(job_part)
-                else:
-                    # Pure description line
-                    if len(line) > 8:
-                        job_buffer.append(line)
-
-                    # If we have a big enough job description and a date, flush it
-                    combined = ' '.join(job_buffer).strip()
-                    if len(combined) > 15 and current_date and is_action_entry(combined):
-                        all_entries.append({
-                            'text': combined,
-                            'date': current_date,
-                            'normalized_text': normalize_maritime_text(combined),
-                            'is_action': True,
-                            'source': f.name,
-                        })
-                        job_buffer = []
-
-            # Flush any remaining buffer
-            if job_buffer and current_date:
-                job_text = ' '.join(job_buffer).strip()
+            def emit_entry(job_text, dates, source_name):
+                """Emit a valid action entry using the last collected date."""
+                if not dates or not job_text:
+                    return None
+                completion_date = dates[-1]  # last date = completion date
                 if len(job_text) > 8 and is_action_entry(job_text):
-                    all_entries.append({
+                    return {
                         'text': job_text,
-                        'date': current_date,
+                        'date': completion_date,
                         'normalized_text': normalize_maritime_text(job_text),
                         'is_action': True,
-                        'source': f.name,
-                    })
+                        'source': source_name,
+                    }
+                return None
+
+            for line in raw_lines:
+                line = line.strip()
+                if not line:
+                    continue
+
+                alpha_count = sum(c.isalpha() for c in line)
+                dates_found = DATE_PATTERN.findall(line)
+
+                # ── Is this line a date (or mostly a date)? ──
+                is_date_line = bool(dates_found) and alpha_count < 8
+
+                if is_date_line:
+                    # Collect all valid dates from this line
+                    for d_str, m_str, y_str in dates_found:
+                        day, month, year = int(d_str), int(m_str), int(y_str)
+                        if year < 100:
+                            year += 2000
+                        if 1 <= day <= 31 and 1 <= month <= 12 and 2010 <= year <= 2099:
+                            try:
+                                collected_dates.append(datetime(year, month, day))
+                            except ValueError:
+                                pass
+
+                elif alpha_count >= 4:
+                    # ── This is a text/description line ──
+
+                    # Before accepting this new line as a job, emit the PREVIOUS job
+                    if current_job_text and collected_dates:
+                        entry = emit_entry(current_job_text, collected_dates, f.name)
+                        if entry:
+                            all_entries.append(entry)
+
+                    # Also handle lines that contain BOTH text AND a date
+                    # e.g. "Replaced valve 12-01-26"
+                    if dates_found:
+                        text_part = DATE_PATTERN.sub('', line).strip()
+                        for d_str, m_str, y_str in dates_found:
+                            day, month, year = int(d_str), int(m_str), int(y_str)
+                            if year < 100:
+                                year += 2000
+                            if 1 <= day <= 31 and 1 <= month <= 12 and 2010 <= year <= 2099:
+                                try:
+                                    collected_dates = [datetime(year, month, day)]
+                                except ValueError:
+                                    pass
+                                break
+                        if len(text_part) > 8:
+                            current_job_text = text_part
+                            # This line is self-contained — emit immediately
+                            if collected_dates and is_action_entry(text_part):
+                                entry = emit_entry(text_part, collected_dates, f.name)
+                                if entry:
+                                    all_entries.append(entry)
+                                current_job_text = None
+                                collected_dates = []
+                    else:
+                        # Pure text description line — start tracking it
+                        current_job_text = line
+                        collected_dates = []  # reset date collection for new job
+
+            # Flush last pending entry
+            if current_job_text and collected_dates:
+                entry = emit_entry(current_job_text, collected_dates, f.name)
+                if entry:
+                    all_entries.append(entry)
 
         except Exception as e:
             st.error(f"❌ Error parsing {f.name}: {e}")
+            import traceback
+            st.expander("Error details").write(traceback.format_exc())
 
-    # Deduplicate identical entries
+    if not all_entries:
+        return all_entries
+
+    # ── Deduplicate identical entries ──
     seen = set()
     unique_entries = []
     for entry in all_entries:
