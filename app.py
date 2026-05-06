@@ -1,7 +1,6 @@
 """
-TEMPORAL PIPELINE v3.0 — The Truth Engine
-MV ALEXIS | MTS Marine Ltd. | Final Production Release
-Architecture: Bipartite Veto Engine + 3-Vector Time Reconstruction
+TEMPORAL PIPELINE v2.0 — Zero-Trust Maritime PMS Audit Engine
+MV ALEXIS | MTS Marine Ltd. | Production Release
 """
 
 import streamlit as st
@@ -9,16 +8,17 @@ import pandas as pd
 import openpyxl
 import io
 import re
+import struct
 from datetime import datetime, date
 from docx import Document
-from rapidfuzz import fuzz
+from rapidfuzz import fuzz, process
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION & DICTIONARIES
+# CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Temporal Pipeline 3.0",
+    page_title="Temporal Pipeline",
     page_icon="⚓",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -50,90 +50,84 @@ MARITIME_ABBREV = {
     r'\bFILTER\b': 'FILTER',
     r'\bVALVE\b': 'VALVE',
     r'\bCOOLER\b': 'COOLER',
+    r'\bNO\.?\s*(\d+)\b': r'NUMBER \1',
+    r'#\s*(\d+)': r'NUMBER \1',
 }
 
+# ── Machine-system extraction ──────────────────────────────────────────────
+# Maps PMS code prefix → canonical machine-system tag
 SYSTEM_TAG_MAP = {
     'ME':  'MAIN ENGINE',
     'DG':  'DIESEL GENERATOR',
     'AE':  'AUX ENGINE',
     'EG':  'EMERGENCY GENERATOR',
     'BL':  'BOILER',
-    'EGE': 'BOILER',
     'BG':  'BILGE',
     'FW':  'FRESH WATER',
     'SW':  'SEA WATER',
     'FO':  'FUEL OIL',
     'LO':  'LUBE OIL',
     'HV':  'HVAC',
-    'CO':  'COMPRESSOR',
     'ST':  'STEERING',
     'CP':  'CARGO PUMP',
     'BP':  'BALLAST PUMP',
-    'PC':  'PUMP',
-    'PG':  'PUMP',
-    'PH':  'PUMP',
-    'FF':  'FAN',
+    'EP':  'ELECTRICAL PANEL',
+    'IN':  'INSTRUMENT',
+    'SA':  'SAFETY',
 }
 
-# 🛑 CONTEXTUAL QUARANTINE (The Veto Box)
-FORBIDDEN_KEYWORDS = {
-    'MAIN ENGINE':      ['D/G', 'D.G.', 'DIESEL GENERATOR', 'GENERATOR', 'PURIFIER', 'DUCK KEEL', 'HOLD', 'DECK', 'BOILER'],
-    'DIESEL GENERATOR': ['M/E', 'M.E.', 'MAIN ENGINE', 'MAIN ENG', 'BOILER', 'STERN TUBE', 'DUCK KEEL', 'HOLD', 'DECK'],
-    'BOILER':           ['M/E', 'MAIN ENGINE', 'D/G', 'DIESEL GENERATOR', 'PURIFIER', 'COMPRESSOR'],
-    'COMPRESSOR':       ['M/E', 'D/G', 'BOILER', 'PURIFIER', 'PUMP'],
-}
-
+# Keywords in TEC text that identify the machine system
 SYSTEM_KEYWORDS = {
-    'MAIN ENGINE':        ['M/E', 'M.E.', 'MAIN ENGINE', 'MAIN ENG', 'M.E'],
-    'DIESEL GENERATOR':   ['D/G', 'D.G.', 'DIESEL GENERATOR', 'DIESEL GEN', 'GENERATOR ENGINE', 'GEN ENGINE', 'D.G'],
-    'BOILER':             ['BOILER', 'BLR', 'EGE', 'ECONOMIZER'],
-    'COMPRESSOR':         ['COMPRESSOR', 'COMP.'],
-    'PUMP':               ['PUMP'],
-    'FAN':                ['FAN', 'EXH. FAN', 'EXH FAN']
+    'MAIN ENGINE':        ['M/E', 'M.E.', 'MAIN ENGINE', 'MAIN ENG'],
+    'DIESEL GENERATOR':   ['D/G', 'D.G.', 'DIESEL GENERATOR', 'DIESEL GEN',
+                           'GENERATOR ENGINE', 'GEN ENGINE'],
+    'AUX ENGINE':         ['A/E', 'A.E.', 'AUX ENGINE', 'AUXILIARY ENGINE'],
+    'EMERGENCY GENERATOR':['E/G', 'EMERGENCY GEN', 'EMERG GEN'],
+    'BOILER':             ['BOILER', 'BLR'],
+    'STEERING':           ['STEERING', 'RUDDER', 'HELM'],
+    'FRESH WATER':        ['FRESH WATER', 'FWG', 'F.W.G', 'F.W'],
+    'FUEL OIL':           ['FUEL OIL', 'HFO', 'MDO', 'F.O', 'FO SYS'],
+    'LUBE OIL':           ['LUBE OIL', 'L.O', 'LUB OIL'],
+    'HVAC':               ['A/C', 'AIR COND', 'HVAC', 'REEFER'],
+    'BILGE':              ['BILGE', 'SLUDGE', 'SEWAGE', 'DUCK KEEL'],
+    'BALLAST PUMP':       ['BALLAST', 'DUCK KEEL'],
+    'CARGO PUMP':         ['CARGO PUMP'],
 }
-
-ACTION_WORDS = {
-    'OVERHAUL', 'OVERHAULED', 'REPLACE', 'REPLACED', 'RENEW', 'RENEWED',
-    'PULL OUT', 'PULLED OUT', 'DISMANTLE', 'DISMANTLED', 'RECONDITION',
-    'RECONDITIONED', 'CHANGE', 'CHANGED', 'FABRICATE', 'FABRICATED',
-    'REBUILD', 'REBUILT', 'REPAIR', 'REPAIRED', 'INSTALL', 'INSTALLED',
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# TEXT ANALYSIS HELPERS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def extract_system_from_code(code: str) -> str | None:
+    """Return canonical system tag from PMS code (e.g. 'ME-02-17' → 'MAIN ENGINE')."""
     if not code or '-' not in code:
         return None
-    return SYSTEM_TAG_MAP.get(code.split('-')[0].upper())
+    prefix = code.split('-')[0].upper()
+    return SYSTEM_TAG_MAP.get(prefix)
+
+def extract_system_from_text(text: str) -> str | None:
+    """Return canonical system tag from TEC diary text, or None if ambiguous."""
+    upper = text.upper()
+    for system, keywords in SYSTEM_KEYWORDS.items():
+        if any(kw.upper() in upper for kw in keywords):
+            return system
+    return None
 
 def extract_cylinder_from_code(code: str) -> int | None:
+    """Return cylinder number from PMS code (e.g. 'ME-02-17' → 2)."""
     parts = code.split('-')
     if len(parts) >= 2:
         try:
-            return int(parts[1])
+            n = int(parts[1])
+            return n if n > 0 else None
         except ValueError:
             return None
     return None
 
-def extract_system_from_text(text: str) -> str | None:
-    upper = text.upper()
-    for system, keywords in SYSTEM_KEYWORDS.items():
-        if any(re.search(rf'\b{re.escape(kw)}\b', upper) for kw in keywords):
-            return system
-    return None
-
 def extract_cylinder_from_text(text: str) -> int | None:
+    """Extract cylinder number from TEC text, e.g. 'CYL. NO.2' → 2."""
     patterns = [
-        r'CYL(?:INDER)?\.?\s*(?:NO\.?|#)?\s*(\d+)',
-        r'UNIT\s*(?:NO\.?|#)?\s*(\d+)',
-        r'D/?G\s*(?:NO\.?|#)?\s*(\d+)',
-        r'A/?E\s*(?:NO\.?|#)?\s*(\d+)',
-        r'COMPRESSOR\s*(?:NO\.?|#)?\s*(\d+)',
-        r'PUMP\s*(?:NO\.?|#)?\s*(\d+)',
-        r'\bNO\.?\s*(\d+)\b',
-        r'#\s*(\d+)'
+        r'CYL\.?\s*NO\.?\s*(\d+)',
+        r'NO\.?\s*(\d+)',
+        r'#\s*(\d+)',
+        r'CYLINDER\s+(?:NUMBER\s+)?(\d+)',
+        r'UNIT\s+NO\.?\s*(\d+)',
     ]
     upper = text.upper()
     for pat in patterns:
@@ -142,22 +136,47 @@ def extract_cylinder_from_text(text: str) -> int | None:
             return int(m.group(1))
     return None
 
+# Action words that indicate maintenance was performed (not just inspection)
+ACTION_WORDS = {
+    'OVERHAUL', 'OVERHAULED', 'REPLACE', 'REPLACED', 'RENEW', 'RENEWED',
+    'PULL OUT', 'PULLED OUT', 'DISMANTLE', 'DISMANTLED', 'RECONDITION',
+    'RECONDITIONED', 'CHANGE', 'CHANGED', 'FABRICATE', 'FABRICATED',
+    'REBUILD', 'REBUILT', 'REPAIR', 'REPAIRED', 'INSTALL', 'INSTALLED',
+}
+
+MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEXT NORMALIZATION
+# ─────────────────────────────────────────────────────────────────────────────
+
 def normalize_maritime_text(text: str) -> str:
+    """Expand maritime abbreviations to full form for accurate matching."""
     text = str(text).upper().strip()
     for pattern, replacement in MARITIME_ABBREV.items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    # Remove special chars except letters, digits, spaces
     text = re.sub(r'[^\w\s]', ' ', text)
-    return re.sub(r'\s+', ' ', text).strip()
+    # Collapse whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 def is_action_entry(text: str) -> bool:
+    """Return True if the text describes actual maintenance work performed."""
     upper = str(text).upper()
     return any(word in upper for word in ACTION_WORDS)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FILE PARSERS
+# FILE EXTRACTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def extract_strings_from_binary(data: bytes, min_length: int = 5) -> list[str]:
+def extract_strings_from_binary(data: bytes, min_length: int = 8) -> list[str]:
+    """
+    Pure-Python equivalent of the Unix `strings` command.
+    Finds sequences of printable ASCII characters in binary data.
+    Works reliably on old .doc (Word 97-2003) binary files.
+    """
     pattern = re.compile(b'[ -~]{' + str(min_length).encode() + b',}')
     results = []
     for match in pattern.finditer(data):
@@ -169,32 +188,110 @@ def extract_strings_from_binary(data: bytes, min_length: int = 5) -> list[str]:
             continue
     return results
 
+def extract_text_from_doc(file_bytes: bytes) -> list[str]:
+    """Extract text lines from a binary .doc file using ASCII string scanning."""
+    raw_strings = extract_strings_from_binary(file_bytes, min_length=8)
+    # Filter for lines that contain alphabetic content
+    return [s for s in raw_strings if sum(1 for c in s if c.isalpha()) >= 4]
+
+def extract_text_from_docx(file_bytes: bytes) -> list[str]:
+    """Extract text lines from a modern .docx file."""
+    doc = Document(io.BytesIO(file_bytes))
+    lines = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text and sum(1 for c in text if c.isalpha()) >= 4:
+            lines.append(text)
+    return lines
+
+def extract_lines_from_word(file_bytes: bytes, filename: str) -> list[str]:
+    """Route to correct extractor based on file extension."""
+    if filename.lower().endswith('.docx'):
+        try:
+            return extract_text_from_docx(file_bytes)
+        except Exception:
+            # Fall back to binary extraction
+            return extract_text_from_doc(file_bytes)
+    else:
+        # .doc binary format
+        lines = extract_text_from_doc(file_bytes)
+        # Also try as docx (some .doc files are actually docx)
+        if not lines:
+            try:
+                return extract_text_from_docx(file_bytes)
+            except Exception:
+                pass
+        return lines
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TEC-19 PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+
 def parse_tec19_files(uploaded_files: list) -> list[dict]:
-    """Extracts job descriptions and exact completion dates from Word documents."""
+    """
+    Parse TEC-19 work diary Word documents.
+
+    Key design decision: operate on RAW binary strings (no alphabetic filtering)
+    so that pure-date strings like '31-01-26' (which have 0 alpha chars) are
+    preserved for date-tracking in the state machine.
+
+    Document table structure (per row):
+      Col 1: Job Description  Col 2: Issued  Col 3: Progress  Col 4: Deadline  Col 5: Completed
+    → Raw strings appear as: [description, deadline_date, issued_date, completed_date, completed_date]
+
+    The state machine tracks all dates seen after a description; the LAST date
+    collected before the next description is treated as the completion date.
+
+    Returns list of {text, date, normalized_text, is_action, source}
+    """
     DATE_PATTERN = re.compile(r'\b(\d{2})[/-](\d{2})[/-](\d{2,4})\b')
     all_entries = []
 
     for f in uploaded_files:
         try:
             file_bytes = f.getvalue()
-            
-            # Extract raw text lines safely
+
+            # ── Extract ALL raw strings, INCLUDING date-only lines ──
+            # This is critical: pure date strings like "06-01-26" have 0 alpha
+            # chars and would be filtered out by any alphabetic content filter.
             if f.name.lower().endswith('.docx'):
                 try:
                     doc = Document(io.BytesIO(file_bytes))
-                    raw_lines = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+                    raw_lines = [p.text.strip() for p in doc.paragraphs
+                                 if p.text.strip()]
                     if not raw_lines:
                         raise ValueError("Empty docx")
                 except Exception:
-                    raw_lines = extract_strings_from_binary(file_bytes)
+                    # Fall back to binary extraction
+                    raw_lines = extract_strings_from_binary(file_bytes, min_length=5)
             else:
-                raw_lines = extract_strings_from_binary(file_bytes)
+                # Binary .doc: use string scanning with short minimum to capture dates
+                raw_lines = extract_strings_from_binary(file_bytes, min_length=5)
 
             if not raw_lines:
+                st.warning(f"⚠️ No text could be extracted from: {f.name}")
                 continue
 
-            current_job_text = None
-            collected_dates = []
+            # ── State machine ──
+            # For each job description, collect all dates that follow it.
+            # The last date in the sequence is the completion date.
+            current_job_text = None       # text of the current job being tracked
+            collected_dates: list = []    # all dates seen since last job text
+
+            def emit_entry(job_text, dates, source_name):
+                """Emit a valid action entry using the last collected date."""
+                if not dates or not job_text:
+                    return None
+                completion_date = dates[-1]  # last date = completion date
+                if len(job_text) > 8 and is_action_entry(job_text):
+                    return {
+                        'text': job_text,
+                        'date': completion_date,
+                        'normalized_text': normalize_maritime_text(job_text),
+                        'is_action': True,
+                        'source': source_name,
+                    }
+                return None
 
             for line in raw_lines:
                 line = line.strip()
@@ -203,10 +300,12 @@ def parse_tec19_files(uploaded_files: list) -> list[dict]:
 
                 alpha_count = sum(c.isalpha() for c in line)
                 dates_found = DATE_PATTERN.findall(line)
+
+                # ── Is this line a date (or mostly a date)? ──
                 is_date_line = bool(dates_found) and alpha_count < 8
 
-                # Process pure date lines
                 if is_date_line:
+                    # Collect all valid dates from this line
                     for d_str, m_str, y_str in dates_found:
                         day, month, year = int(d_str), int(m_str), int(y_str)
                         if year < 100:
@@ -216,19 +315,18 @@ def parse_tec19_files(uploaded_files: list) -> list[dict]:
                                 collected_dates.append(datetime(year, month, day))
                             except ValueError:
                                 pass
-                                
-                # Process text/job lines
-                elif alpha_count >= 4:
-                    # Flush previous job if we have a new one
-                    if current_job_text and collected_dates:
-                        if len(current_job_text) > 8 and is_action_entry(current_job_text):
-                            all_entries.append({
-                                'text': current_job_text,
-                                'date': collected_dates[-1], # Last date is completion
-                                'normalized_text': normalize_maritime_text(current_job_text),
-                                'source': f.name
-                            })
 
+                elif alpha_count >= 4:
+                    # ── This is a text/description line ──
+
+                    # Before accepting this new line as a job, emit the PREVIOUS job
+                    if current_job_text and collected_dates:
+                        entry = emit_entry(current_job_text, collected_dates, f.name)
+                        if entry:
+                            all_entries.append(entry)
+
+                    # Also handle lines that contain BOTH text AND a date
+                    # e.g. "Replaced valve 12-01-26"
                     if dates_found:
                         text_part = DATE_PATTERN.sub('', line).strip()
                         for d_str, m_str, y_str in dates_found:
@@ -241,36 +339,35 @@ def parse_tec19_files(uploaded_files: list) -> list[dict]:
                                 except ValueError:
                                     pass
                                 break
-                                
                         if len(text_part) > 8:
                             current_job_text = text_part
+                            # This line is self-contained — emit immediately
                             if collected_dates and is_action_entry(text_part):
-                                all_entries.append({
-                                    'text': current_job_text,
-                                    'date': collected_dates[-1],
-                                    'normalized_text': normalize_maritime_text(current_job_text),
-                                    'source': f.name
-                                })
+                                entry = emit_entry(text_part, collected_dates, f.name)
+                                if entry:
+                                    all_entries.append(entry)
                                 current_job_text = None
                                 collected_dates = []
                     else:
+                        # Pure text description line — start tracking it
                         current_job_text = line
-                        collected_dates = []
+                        collected_dates = []  # reset date collection for new job
 
-            # Flush the final entry
+            # Flush last pending entry
             if current_job_text and collected_dates:
-                if len(current_job_text) > 8 and is_action_entry(current_job_text):
-                    all_entries.append({
-                        'text': current_job_text,
-                        'date': collected_dates[-1],
-                        'normalized_text': normalize_maritime_text(current_job_text),
-                        'source': f.name
-                    })
+                entry = emit_entry(current_job_text, collected_dates, f.name)
+                if entry:
+                    all_entries.append(entry)
 
         except Exception as e:
             st.error(f"❌ Error parsing {f.name}: {e}")
+            import traceback
+            st.expander("Error details").write(traceback.format_exc())
 
-    # Deduplicate exact same entries
+    if not all_entries:
+        return all_entries
+
+    # ── Deduplicate identical entries ──
     seen = set()
     unique_entries = []
     for entry in all_entries:
@@ -281,461 +378,985 @@ def parse_tec19_files(uploaded_files: list) -> list[dict]:
 
     return unique_entries
 
-def parse_pms_excel(file_bytes: bytes) -> tuple[pd.DataFrame | None, str | None]:
-    """Extracts PMS components, claimed hours, and monthly historical running hours."""
+# ─────────────────────────────────────────────────────────────────────────────
+# PMS EXCEL PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_pms_excel(file_bytes: bytes) -> tuple[pd.DataFrame | None, str | None, dict]:
+    """
+    Parse the PMS Excel file with the MTS Marine structure.
+
+    Returns:
+        (df, error_message, column_map)
+        df columns: code, component, job_type, interval_hrs, last_oh_date,
+                    hrs_end_last_yr, current_hrs, monthly_jan..dec, normalized_component
+    """
+    meta = {}
     try:
         wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     except Exception as e:
-        return None, f"Cannot open Excel file: {e}"
+        return None, f"Cannot open Excel file: {e}", {}
 
+    # Suppress openpyxl warnings
     import warnings
     warnings.filterwarnings('ignore', category=UserWarning)
 
-    target_sheet = wb.active
+    # Try PMS sheet first, then any sheet with component data
+    target_sheet = None
     for name in wb.sheetnames:
         if 'PMS' in name.upper():
             target_sheet = wb[name]
             break
+    if target_sheet is None:
+        target_sheet = wb.active
 
-    df_scan = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet.title, engine='openpyxl', header=None)
+    ws = target_sheet
+    meta['sheet_name'] = ws.title
 
-    header_idx = 7
+    # ── Find header row (look for 'CODE' or 'ITEMS' keyword) ──
+    header_row_idx = None
+    for row in ws.iter_rows(min_row=1, max_row=20, values_only=True):
+        row_text = ' '.join(str(v).upper() for v in row if v)
+        if ('CODE' in row_text or 'ITEMS' in row_text) and 'INTERVAL' in row_text:
+            header_row_idx = row[0]  # store for reference
+            break
+        if ('CODE' in row_text) and 'INSPECTION' in row_text:
+            break
+
+    # ── Read with pandas, searching for the actual header ──
+    df_scan = pd.read_excel(io.BytesIO(file_bytes), sheet_name=ws.title,
+                            engine='openpyxl', header=None)
+
+    header_idx = 7  # Default (row 8 in 1-indexed = idx 7)
     for idx, row in df_scan.head(15).iterrows():
         row_str = ' '.join(str(v).upper() for v in row if pd.notna(v))
         if ('ITEMS' in row_str or 'CODE' in row_str) and 'INTERVAL' in row_str:
             header_idx = idx
             break
 
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=target_sheet.title, engine='openpyxl', header=header_idx, dtype={0: str})
-    df.columns = [str(c).strip().upper() if pd.notna(c) else f'COL_{i}' for i, c in enumerate(df.columns)]
+    # ── Re-read with correct header ──
+    # Use data_only to get computed formula values
+    df = pd.read_excel(
+        io.BytesIO(file_bytes),
+        sheet_name=ws.title,
+        engine='openpyxl',
+        header=header_idx,
+        dtype={0: str}  # Keep code as string
+    )
 
-    def find_col(keywords):
+    # Normalize column names
+    df.columns = [str(c).strip().upper() if pd.notna(c) else f'COL_{i}'
+                  for i, c in enumerate(df.columns)]
+
+    meta['raw_columns'] = list(df.columns[:22])
+
+    # ── Map columns to standard names ──
+    col_map = {}
+
+    def find_col(keywords, df_cols):
         for keyword in keywords:
-            for col in df.columns:
+            for col in df_cols:
                 if keyword in col:
                     return col
         return None
 
-    # Map core columns
-    cmap = {
-        'code': df.columns[0] if len(df.columns) > 0 else None,
-        'component': find_col(['ITEMS', 'DESCRIPTION', 'EQUIPMENT']) or (df.columns[1] if len(df.columns) > 1 else None),
-        'interval': find_col(['INTERVAL']),
-        'date': find_col(['DATE OF LAST', 'LAST INSPECTION', 'LAST OVERHAUL']),
-        'hrs_end_yr': find_col(['OPERATING HOURS AT', 'END OF LAST']),
-        'current_hrs': find_col(['CURRENT OPERAT'])
-    }
-    
-    # Fallbacks for complex headers
-    if not cmap['date']:
-        for col in df.columns[4:10]:
+    cols = list(df.columns)
+
+    # Code column: typically first col, format ME-01-01
+    col_map['code'] = cols[0] if cols else None
+
+    # Component name: ITEMS or DESCRIPTION
+    col_map['component'] = (find_col(['ITEMS', 'DESCRIPTION', 'EQUIPMENT', 'NAME'], cols)
+                            or cols[1] if len(cols) > 1 else None)
+
+    # Job type
+    col_map['job'] = find_col(['JOB'], cols) or (cols[2] if len(cols) > 2 else None)
+
+    # Interval hours
+    col_map['interval'] = find_col(['INTERVAL'], cols) or (cols[3] if len(cols) > 3 else None)
+
+    # Date of last inspection/overhaul
+    col_map['date'] = find_col(['DATE OF LAST', 'LAST INSPECTION', 'LAST OVERHAUL'], cols)
+    if not col_map['date']:
+        # Look for a column containing dates
+        for col in cols[4:10]:
             if 'DATE' in col:
-                cmap['date'] = col
+                col_map['date'] = col
                 break
-                
-    if not cmap['hrs_end_yr'] and cmap['date']:
-        try:
-            date_pos = list(df.columns).index(cmap['date'])
-            if date_pos + 1 < len(df.columns):
-                cmap['hrs_end_yr'] = df.columns[date_pos + 1]
-        except ValueError:
-            pass
-            
-    if not cmap['current_hrs'] and cmap['hrs_end_yr']:
-        try:
-            pos = list(df.columns).index(cmap['hrs_end_yr'])
-            if pos + 1 < len(df.columns):
-                cmap['current_hrs'] = df.columns[pos + 1]
-        except ValueError:
-            pass
 
-    # Map monthly tracking columns for Vector 2 Math
-    month_keys = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+    # Operating hours at end of last year
+    col_map['hrs_end_yr'] = find_col(['OPERATING HOURS AT', 'END OF LAST'], cols)
+    if not col_map['hrs_end_yr']:
+        # It's typically the column after the date column
+        if col_map['date']:
+            date_pos = list(df.columns).index(col_map['date'])
+            if date_pos + 1 < len(cols):
+                col_map['hrs_end_yr'] = cols[date_pos + 1]
+
+    # Current operating hours
+    col_map['current_hrs'] = find_col(['CURRENT OPERAT'], cols)
+    if not col_map['current_hrs']:
+        if col_map['hrs_end_yr']:
+            pos = list(df.columns).index(col_map['hrs_end_yr'])
+            if pos + 1 < len(cols):
+                col_map['current_hrs'] = cols[pos + 1]
+
+    # Monthly hours: Jan through Dec (12 consecutive columns after current_hrs or est. date)
     monthly_cols = {}
-    for m in month_keys:
-        found = find_col([m.upper()])
-        if found:
-            monthly_cols[m] = found
+    month_patterns = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN',
+                      'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
 
+    for i, (month_key, pattern) in enumerate(zip(
+            ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+             'jul', 'aug', 'sep', 'oct', 'nov', 'dec'],
+            month_patterns)):
+        found = find_col([pattern], cols)
+        if found:
+            monthly_cols[month_key] = found
+        else:
+            # Fallback: use positional (cols 9-20 in the known structure)
+            target_idx = 9 + i
+            if target_idx < len(cols):
+                monthly_cols[month_key] = cols[target_idx]
+
+    meta['col_map'] = col_map
+    meta['monthly_cols'] = monthly_cols
+
+    # ── Build clean DataFrame ──
+    required = ['code', 'component', 'date']
+    missing = [k for k in required if not col_map.get(k)]
+    if missing:
+        return None, (f"Could not locate required columns: {missing}. "
+                      f"Found headers: {list(df.columns[:15])}"), meta
+
+    # Build the output dataframe
     output_rows = []
     for _, row in df.iterrows():
-        code = str(row.get(cmap.get('code'), '')).strip()
-        comp = str(row.get(cmap.get('component'), '')).strip()
+        code = str(row.get(col_map['code'], '')).strip()
+        component = str(row.get(col_map['component'], '')).strip()
 
+        # Only process rows with a valid component code (e.g., ME-01-01)
         if not re.match(r'^[A-Z]{2,4}-\d{2}-\d{2,3}$', code):
             continue
-        if not comp or comp.upper() in ('NAN', 'NONE', ''):
+        if not component or component.upper() in ('NAN', 'NONE', ''):
             continue
 
-        raw_date = row.get(cmap['date']) if cmap.get('date') else None
-        last_date = None
-        if pd.notna(raw_date):
+        # Get date
+        raw_date = row.get(col_map['date']) if col_map.get('date') else None
+        last_oh_date = None
+        if pd.notna(raw_date) and raw_date:
             if isinstance(raw_date, (datetime, date)):
-                last_date = datetime.combine(raw_date, datetime.min.time()) if isinstance(raw_date, date) and not isinstance(raw_date, datetime) else raw_date
+                last_oh_date = raw_date if isinstance(raw_date, datetime) else datetime.combine(raw_date, datetime.min.time())
             else:
                 for fmt in ['%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y']:
                     try:
-                        last_date = datetime.strptime(str(raw_date)[:10], fmt)
+                        last_oh_date = datetime.strptime(str(raw_date)[:10], fmt)
                         break
                     except ValueError:
-                        pass
+                        continue
 
-        def safe_float(val):
+        # Get job type
+        job_type = str(row.get(col_map.get('job', ''), '')).strip()
+
+        # Get interval hours
+        interval_raw = row.get(col_map.get('interval', ''), None)
+        interval_hrs = None
+        if pd.notna(interval_raw) and interval_raw:
             try:
-                return float(str(val).replace(',', ''))
+                interval_hrs = float(str(interval_raw).replace(',', ''))
             except (ValueError, TypeError):
-                return 0.0
+                interval_hrs = None  # MONTHLY or non-numeric
 
-        interval_raw = row.get(cmap.get('interval'))
-        interval_hrs = safe_float(interval_raw) if pd.notna(interval_raw) else None
-        
-        claimed_raw = row.get(cmap.get('current_hrs'))
-        claimed_hrs = safe_float(claimed_raw) if pd.notna(claimed_raw) else None
+        # Get hours at end of last year
+        hrs_end_yr = None
+        if col_map.get('hrs_end_yr'):
+            v = row.get(col_map['hrs_end_yr'])
+            if pd.notna(v):
+                try:
+                    hrs_end_yr = float(v)
+                except (ValueError, TypeError):
+                    pass
 
-        row_data = {
+        # Get current hours
+        current_hrs = None
+        if col_map.get('current_hrs'):
+            v = row.get(col_map['current_hrs'])
+            if pd.notna(v):
+                try:
+                    current_hrs = float(v)
+                except (ValueError, TypeError):
+                    pass
+
+        # Get monthly hours
+        monthly = {}
+        for month_key, col_name in monthly_cols.items():
+            v = row.get(col_name)
+            if pd.notna(v):
+                try:
+                    monthly[month_key] = float(v)
+                except (ValueError, TypeError):
+                    monthly[month_key] = 0.0
+            else:
+                monthly[month_key] = 0.0
+
+        output_rows.append({
             'code': code,
-            'component': comp,
-            'normalized_component': normalize_maritime_text(comp),
+            'component': component,
+            'job_type': job_type,
             'interval_hrs': interval_hrs,
-            'last_oh_date': last_date,
-            'claimed_current_hrs': claimed_hrs,
-            'hrs_end_last_yr': safe_float(row.get(cmap.get('hrs_end_yr'))),
-        }
-        
-        for m, c in monthly_cols.items():
-            if c:
-                row_data[f'hrs_{m}'] = safe_float(row.get(c))
-                
-        output_rows.append(row_data)
+            'last_oh_date': last_oh_date,
+            'hrs_end_last_yr': hrs_end_yr,
+            'current_hrs': current_hrs,
+            'normalized_component': normalize_maritime_text(component),
+            **{f'hrs_{k}': v for k, v in monthly.items()}
+        })
 
-    return pd.DataFrame(output_rows), None
+    if not output_rows:
+        return None, "No valid component rows found in PMS sheet.", meta
+
+    result_df = pd.DataFrame(output_rows)
+    return result_df, None, meta
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VECTOR 2 & 3: THE TRUTH RECONSTRUCTION ENGINE
+# FUZZY MATCHING ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def calculate_true_hours(pms_row: dict, anchor_date: datetime | None, audit_date: datetime) -> tuple[float | None, str]:
-    """Vector 2: Calculates TRUE hours based on TEC exact date and historical monthly logs."""
-    if not anchor_date:
-        return None, "No Valid TEC Anchor"
-    
-    m_keys = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+def find_best_pms_match(tec_normalized: str, pms_df: pd.DataFrame,
+                        threshold: int = 58,
+                        tec_original: str = '') -> dict | None:
+    """
+    Find the best matching PMS component for a TEC diary entry.
+
+    Scoring pipeline:
+      1. Base fuzzy score: token_set_ratio (handles word reordering / extra words)
+      2. Machine-system bonus/penalty: boosts same-system matches (+15),
+         heavily penalises cross-system matches (×0.50)
+      3. Cylinder-number bonus/penalty: boosts same-cylinder (+10),
+         penalises explicit cylinder mismatch (×0.65)
+
+    This prevents D/G TEC entries from matching M/E PMS components and
+    stops CYL #2 TEC evidence from being credited to CYL #3/4/5 rows.
+    """
+    if pms_df.empty:
+        return None
+
+    tec_system   = extract_system_from_text(tec_original or tec_normalized)
+    tec_cylinder = extract_cylinder_from_text(tec_original or tec_normalized)
+
+    best_score = 0
+    best_row   = None
+
+    for _, row in pms_df.iterrows():
+        comp_norm   = row['normalized_component']
+        pms_code    = str(row.get('code', ''))
+        pms_system  = extract_system_from_code(pms_code)
+        pms_cylinder = extract_cylinder_from_code(pms_code)
+
+        # ── Base fuzzy score ──
+        score_set  = fuzz.token_set_ratio(tec_normalized, comp_norm)
+        score_sort = fuzz.token_sort_ratio(tec_normalized, comp_norm)
+        base = max(score_set, score_sort * 0.95)
+
+        # ── Machine-system alignment ──
+        if tec_system and pms_system:
+            if tec_system == pms_system:
+                base = min(100, base + 15)          # same system: boost
+            else:
+                base = base * 0.50                  # different system: heavy penalty
+
+        # ── Cylinder-number alignment ──
+        if tec_cylinder and pms_cylinder:
+            if tec_cylinder == pms_cylinder:
+                base = min(100, base + 10)          # same cylinder: boost
+            else:
+                base = base * 0.65                  # explicit mismatch: penalty
+
+        if base > best_score:
+            best_score = base
+            best_row   = row.copy()
+
+    if best_score >= threshold and best_row is not None:
+        best_row['match_score'] = round(best_score, 1)
+        return best_row.to_dict()
+
+    return None
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHYSICS VALIDATOR
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_max_possible_hours(pms_row: dict, audit_date: datetime) -> tuple:
+    """
+    Calculate max possible hours and flag if this is a current-year overhaul.
+
+    For current-year overhauls: exact monthly tracking is available.
+      max_hours = sum of monthly hours from overhaul month to audit month.
+
+    For prior-year overhauls: we use G (hrs_end_last_yr) as the validated baseline.
+      max_hours = hrs_end_last_yr + sum of this year's monthly hours.
+      These should match current_hrs by formula definition.
+
+    Returns: (max_hours: float, is_current_year: bool)
+    """
+    last_oh = pms_row.get('last_oh_date')
+    if not last_oh:
+        return float('inf'), False
+
+    if isinstance(last_oh, str):
+        try:
+            last_oh = datetime.fromisoformat(last_oh)
+        except Exception:
+            return float('inf'), False
+
+    month_keys = ['jan', 'feb', 'mar', 'apr', 'may', 'jun',
+                  'jul', 'aug', 'sep', 'oct', 'nov', 'dec']
+
     audit_month = min(audit_date.month, 12)
-    
-    if anchor_date.year == audit_date.year:
-        # Sum from the month of the physical overhaul to the audit month
-        true_hrs = sum(pms_row.get(f'hrs_{m_keys[i]}', 0.0) for i in range(anchor_date.month - 1, audit_month))
-        return true_hrs, "Current Year Math"
-        
-    elif anchor_date.year < audit_date.year:
-        # Use End-of-Year baseline plus this year's running hours
-        baseline = pms_row.get('hrs_end_last_yr', 0.0)
-        current_yr_total = sum(pms_row.get(f'hrs_{m_keys[i]}', 0.0) for i in range(audit_month))
-        return baseline + current_yr_total, "Prior Year Baseline + Math"
-        
-    return None, "Future Date Error"
+    current_year = audit_date.year
 
-def triage_delta(calculated_true: float | None, claimed: float | None, interval: float | None) -> tuple[str, str]:
-    """Vector 3: Exposes the exact reality of the crew's claims."""
-    if calculated_true is None:
-        return "👻 GHOST", "Missing valid TEC-19 proof."
-    
-    if interval and calculated_true > interval:
-        return "🔴 DANGER", f"True hours ({calculated_true:.0f}) exceed {interval:.0f} hr safety interval."
+    if last_oh.year == current_year:
+        # Current-year overhaul: physics check using exact monthly data
+        overhaul_month = last_oh.month
+        total = sum(
+            pms_row.get(f'hrs_{month_keys[i]}', 0.0) or 0.0
+            for i in range(overhaul_month - 1, audit_month)
+        )
+        return total, True
 
-    if claimed is None or claimed == 0.0:
-        return "🟡 INCOMPLETE", f"Crew did not log current hours. True hours are {calculated_true:.0f}."
+    elif last_oh.year < current_year:
+        # Prior-year overhaul: G-value is the pre-validated baseline
+        hrs_end_yr = pms_row.get('hrs_end_last_yr') or 0.0
+        current_yr_total = sum(
+            pms_row.get(f'hrs_{k}', 0.0) or 0.0
+            for k in month_keys[:audit_month]
+        )
+        return hrs_end_yr + current_yr_total, False
 
-    # Compare True vs Claimed (Allow 5% or 10hr tolerance for pro-rata rounding)
-    delta = claimed - calculated_true
-    tolerance = max(10, calculated_true * 0.05)
+    else:
+        return 0.0, False
 
-    if abs(delta) <= tolerance:
-        return "✅ PERFECT", f"Claimed ({claimed:.0f}) aligns with Truth ({calculated_true:.0f})."
-    
-    if delta > tolerance:
-        return "🟠 FORGOTTEN", f"Crew claims {claimed:.0f}, but Truth is {calculated_true:.0f}. They forgot to reset the counter."
-    
-    if delta < -tolerance:
-        return "🔴 FRAUD", f"Crew claims {claimed:.0f}, but Truth is {calculated_true:.0f}. Hours suspiciously under-reported."
-        
-    return "UNKNOWN", "Unhandled condition."
+def classify_physics_violation(current_hrs: float, max_possible: float,
+                               interval_hrs: float | None,
+                               is_current_year: bool = False) -> tuple[str, str]:
+    """
+    Returns (violation_type, description).
+    Physics violations are ONLY flagged for current-year overhauls where we have
+    exact monthly data. Prior-year overhauls use interval checks only.
+    """
+    if current_hrs is None:
+        return 'UNKNOWN', 'Current hours not recorded in PMS'
+
+    # PHYSICS VIOLATION: Only for current-year overhauls
+    # (we have exact monthly hour data to compare against)
+    if is_current_year and max_possible != float('inf') and max_possible >= 0:
+        if current_hrs > max_possible + 10:  # 10hr tolerance for rounding
+            excess = current_hrs - max_possible
+            return ('PHYSICS_VIOLATION',
+                    f"PMS claims {current_hrs:.0f} hrs but only {max_possible:.0f} hrs "
+                    f"possible since this year's overhaul (excess: +{excess:.0f} hrs). "
+                    f"Hour counter was NOT reset after overhaul.")
+
+    # OVERDUE: Component has exceeded its service interval
+    if interval_hrs and current_hrs and interval_hrs > 0 and current_hrs > interval_hrs:
+        excess = current_hrs - interval_hrs
+        return ('OVERDUE',
+                f"Component has run {current_hrs:.0f} hrs against a "
+                f"{interval_hrs:.0f} hr service interval (+{excess:.0f} hrs overdue).")
+
+    # HEALTHY
+    if is_current_year:
+        return 'OK', f"Hours ({current_hrs:.0f} / {max_possible:.0f} max since overhaul)"
+    else:
+        return 'OK', f"Hours ({current_hrs:.0f} / {interval_hrs:.0f} interval)" if interval_hrs else f"Hours: {current_hrs:.0f}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VECTOR 1: GLOBAL BIPARTITE VETO ENGINE
+# MAIN AUDIT ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_truth_engine(pms_df: pd.DataFrame, tec_entries: list[dict], audit_date: datetime, threshold: int) -> dict:
+def run_audit(pms_df: pd.DataFrame, tec_entries: list[dict],
+              audit_date: datetime, match_threshold: int) -> dict:
+    """
+    Cross-reference PMS components against TEC-19 diary entries.
+    Returns a 4-tier triage result dict.
+    """
     results = {
-        'perfect_sync': [], 'forgotten_reset': [], 'fraud_risk': [], 
-        'overdue': [], 'ghost': [], 'unlogged': [], 'date_conflicts': []
+        'verified_syncs': [],      # Date + hours match, physics OK
+        'physics_violations': [],   # Hours physically impossible
+        'date_conflicts': [],       # TEC date ≠ PMS date
+        'ghost_overhauls': [],      # PMS entry with NO TEC evidence
+        'unlogged_jobs': [],        # TEC entry with NO PMS entry
+        'missing_hours': [],        # TEC match found but hours not recorded
     }
-    
-    # 1. Bipartite Matrix Generation
-    candidates = []
-    
-    for p_idx, p_row in pms_df.iterrows():
-        p_sys = extract_system_from_code(p_row['code'])
-        p_cyl = extract_cylinder_from_code(p_row['code'])
-        p_norm = p_row['normalized_component']
-        
-        for t_idx, t_row in enumerate(tec_entries):
-            t_text = t_row['text'].upper()
-            t_sys = extract_system_from_text(t_text)
-            t_cyl = extract_cylinder_from_text(t_text)
-            
-            # 🛑 VETO GATES
-            if p_sys in FORBIDDEN_KEYWORDS:
-                if any(k in t_text for k in FORBIDDEN_KEYWORDS[p_sys]):
-                    continue # Hard Quarantine Veto
-                    
-            if p_sys and t_sys and p_sys != t_sys:
-                continue # Hard System Veto
-                
-            if p_sys in ['MAIN ENGINE', 'DIESEL GENERATOR']:
-                if p_cyl and t_cyl and p_cyl != t_cyl:
-                    continue # Hard Cylinder Veto
-            
-            # 🟢 PROTECTED FUZZY MATCH
-            score_set = fuzz.token_set_ratio(p_norm, t_row['normalized_text'])
-            score_sort = fuzz.token_sort_ratio(p_norm, t_row['normalized_text'])
-            score = max(score_set, score_sort * 0.95)
-            
-            # Anchor Bonus
-            if p_cyl and t_cyl and p_cyl == t_cyl:
-                score = min(100, score + 15)
-            
-            if score >= threshold:
-                candidates.append((score, p_idx, t_idx))
 
-    # 2. The 1-to-1 Consumption Lock
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    claimed_pms = set()
-    claimed_tec = set()
-    final_matches = {}
-    
-    for score, p, t in candidates:
-        if p not in claimed_pms and t not in claimed_tec:
-            final_matches[p] = (t, score)
-            claimed_pms.add(p)
-            claimed_tec.add(t) # Evidence is permanently locked
+    # Index TEC entries by normalized text for fast lookup
+    tec_by_date = {}
+    for entry in tec_entries:
+        d = entry['date']
+        if d:
+            month_key = d.strftime('%Y-%m')
+            tec_by_date.setdefault(month_key, []).append(entry)
 
-    # 3. Vector 2 & 3 Integration
-    for p_idx, p_row in pms_df.iterrows():
-        code = p_row['code']
-        comp = p_row['component']
-        claimed_hrs = p_row['claimed_current_hrs']
-        interval = p_row['interval_hrs']
-        p_date = p_row['last_oh_date']
-        
-        if p_idx not in final_matches:
-            results['ghost'].append({
-                'Code': code, 'Component': comp, 
-                'PMS Date': p_date.strftime('%Y-%m-%d') if pd.notna(p_date) else '—',
-                'Claimed Hrs': f"{claimed_hrs:.0f}" if claimed_hrs else '—', 
-                'Status': '👻 GHOST OVERHAUL — No Valid TEC Evidence',
+    matched_tec_ids = set()
+
+    # ── For each PMS component, find matching TEC entry ──
+    for _, pms_row in pms_df.iterrows():
+        component = pms_row['component']
+        code = pms_row['code']
+        pms_date = pms_row['last_oh_date']
+        current_hrs = pms_row['current_hrs']
+        interval_hrs = pms_row['interval_hrs']
+        pms_norm = pms_row['normalized_component']
+
+        # Skip components with no overhaul date or NaT
+        if pms_date is None or (hasattr(pms_date, 'isnull') and pms_date.isnull()):
+            continue
+        try:
+            _ = pms_date.strftime('%d-%m-%Y')
+        except (ValueError, AttributeError):
+            continue
+
+        # ── Find best TEC match (machine-type-aware) ──
+        best_tec   = None
+        best_score = 0
+        pms_system   = extract_system_from_code(code)
+        pms_cylinder = extract_cylinder_from_code(code)
+
+        for i, tec_entry in enumerate(tec_entries):
+            tec_norm     = tec_entry['normalized_text']
+            tec_orig     = tec_entry['text']
+            tec_system   = extract_system_from_text(tec_orig)
+            tec_cylinder = extract_cylinder_from_text(tec_orig)
+
+            # Base fuzzy score
+            score_set  = fuzz.token_set_ratio(pms_norm, tec_norm)
+            score_sort = fuzz.token_sort_ratio(pms_norm, tec_norm)
+            combined   = max(score_set, score_sort * 0.95)
+
+            # Machine-system alignment
+            if tec_system and pms_system:
+                if tec_system == pms_system:
+                    combined = min(100, combined + 15)
+                else:
+                    combined *= 0.50          # cross-system: heavy penalty
+
+            # Cylinder-number alignment
+            if tec_cylinder and pms_cylinder:
+                if tec_cylinder == pms_cylinder:
+                    combined = min(100, combined + 10)
+                else:
+                    combined *= 0.65          # wrong cylinder: penalty
+
+            if combined > best_score:
+                best_score = combined
+                best_tec   = (i, tec_entry)
+
+        if best_score < match_threshold or best_tec is None:
+            # No TEC evidence found → Ghost overhaul
+            results['ghost_overhauls'].append({
+                'Code': code,
+                'Component': component,
+                'PMS Date': pms_date.strftime('%d-%m-%Y') if pms_date else '—',
+                'Current Hrs': f"{current_hrs:.0f}" if current_hrs else '—',
+                'Interval Hrs': f"{interval_hrs:.0f}" if interval_hrs else '—',
+                'Status': '❌ No TEC-19 Evidence Found',
+                'Confidence': f'{best_score:.0f}%' if best_score > 0 else '0%',
             })
             continue
 
-        t_idx, score = final_matches[p_idx]
-        t_row = tec_entries[t_idx]
-        t_date = t_row['date']
+        tec_idx, tec_match = best_tec
+        matched_tec_ids.add(tec_idx)
 
-        # Vector 2: Reconstruct Truth
-        true_hrs, math_method = calculate_true_hours(p_row.to_dict(), t_date, audit_date)
-        
-        # Vector 3: Expose Reality
-        status_flag, msg = triage_delta(true_hrs, claimed_hrs, interval)
+        # ── Compare dates ──
+        tec_date = tec_match['date']
+        # Full date match: same year AND same month
+        date_match = (tec_date and pms_date and
+                      tec_date.year == pms_date.year and
+                      tec_date.month == pms_date.month)
+        # Year-only match: same year but different month
+        year_match = (tec_date and pms_date and tec_date.year == pms_date.year)
 
+        # ── Physics check ──
+        max_hrs, is_curr_yr = calculate_max_possible_hours(pms_row.to_dict(), audit_date)
+        phys_status, phys_msg = classify_physics_violation(current_hrs, max_hrs, interval_hrs, is_curr_yr)
+
+        # ── Build result record ──
         record = {
-            'Code': code, 
-            'Component': comp, 
-            'TEC Anchor Date': t_date.strftime('%Y-%m-%d'),
-            'PMS Claimed Date': p_date.strftime('%Y-%m-%d') if pd.notna(p_date) else '—',
-            'TEC Evidence': t_row['text'][:80], 
-            'Match': f"{score:.0f}%",
-            'Calculated TRUE Hrs': f"{true_hrs:.0f}" if true_hrs is not None else '—',
-            'Claimed Excel Hrs': f"{claimed_hrs:.0f}" if claimed_hrs else '—',
-            'Interval Limit': f"{interval:.0f}" if interval else '—',
-            'Verdict': msg
+            'Code': code,
+            'Component': component,
+            'PMS Date': pms_date.strftime('%d-%m-%Y') if pms_date else '—',
+            'TEC Date': tec_date.strftime('%d-%m-%Y') if tec_date else '—',
+            'TEC Evidence': tec_match['text'][:120],
+            'Match Confidence': f'{best_score:.0f}%',
+            'Current Hrs': f"{current_hrs:.1f}" if current_hrs is not None else '—',
+            'Max Hrs Since OH': f"{max_hrs:.1f}" if max_hrs != float('inf') else 'N/A (prior yr)',
+            'Interval Hrs': f"{interval_hrs:.0f}" if interval_hrs else '—',
+            'OH Year': 'Current' if is_curr_yr else 'Prior',
+            'Physics Check': phys_msg,
+            'Source File': tec_match['source'],
         }
 
-        # Route to correct bucket based on Vector 3 Expose
-        if pd.notna(p_date) and t_date and (t_date.year != p_date.year or t_date.month != p_date.month):
-            record['Verdict'] = f"DATE CONFLICT: Work done {t_date.strftime('%b %Y')} but claimed {p_date.strftime('%b %Y')}."
+        # ── Classify ──
+        if phys_status == 'PHYSICS_VIOLATION':
+            record['Status'] = '🔴 PHYSICS VIOLATION — Counter Not Reset'
+            results['physics_violations'].append(record)
+        elif phys_status == 'OVERDUE':
+            record['Status'] = '🟠 OVERDUE — Exceeds Service Interval'
+            record['Overdue Detail'] = phys_msg
+            results['physics_violations'].append(record)
+        elif not year_match:
+            # TEC evidence found but belongs to a different year entirely
+            # → treat as Ghost (no corroborating evidence for the claimed year)
+            record['Status'] = '👻 GHOST — No TEC Evidence for Claimed Year'
+            record['Note'] = (f"PMS claims {pms_date.strftime('%b %Y')} but "
+                              f"best TEC match is from {tec_date.strftime('%b %Y') if tec_date else '?'} "
+                              f"(different year — upload the corresponding diary)")
+            results['ghost_overhauls'].append(record)
+        elif not date_match:
+            # Same year, different month → genuine date discrepancy
+            record['Conflict'] = (f"PMS claims {pms_date.strftime('%b %Y')}, "
+                                  f"TEC diary says {tec_date.strftime('%b %Y') if tec_date else 'unknown'}")
+            record['Status'] = '⚠️ DATE CONFLICT — Same Year, Different Month'
             results['date_conflicts'].append(record)
-        elif "DANGER" in status_flag:
-            results['overdue'].append(record)
-        elif "FRAUD" in status_flag:
-            results['fraud_risk'].append(record)
-        elif "FORGOTTEN" in status_flag:
-            results['forgotten_reset'].append(record)
-        elif "PERFECT" in status_flag:
-            results['perfect_sync'].append(record)
+        elif current_hrs is None or current_hrs == 0.0:
+            record['Status'] = '🟡 INCOMPLETE — Hours Not Recorded in PMS'
+            results['missing_hours'].append(record)
         else:
-            results['ghost'].append(record)
+            record['Status'] = '✅ VERIFIED SYNC'
+            results['verified_syncs'].append(record)
 
-    # 4. Find Unlogged Jobs
-    for i, t in enumerate(tec_entries):
-        if i not in claimed_tec:
-            results['unlogged'].append({
-                'TEC Date': t['date'].strftime('%Y-%m-%d'), 
-                'Evidence': t['text'][:120], 
-                'Status': '📋 UNLOGGED — Performed but not added to PMS Excel'
-            })
+    # ── Find TEC entries with NO PMS match ──
+    for i, tec_entry in enumerate(tec_entries):
+        if i in matched_tec_ids:
+            continue
+        results['unlogged_jobs'].append({
+            'TEC Description': tec_entry['text'][:150],
+            'TEC Date': tec_entry['date'].strftime('%d-%m-%Y') if tec_entry['date'] else '—',
+            'Source': tec_entry['source'],
+            'Status': '📋 JOB PERFORMED — Not Found in PMS Ledger',
+        })
 
     return results
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REPORT & UI ENGINE
+# EXPORT ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_excel_report(results: dict, vessel: str, d: datetime) -> bytes:
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine='xlsxwriter') as w:
-        wb = w.book
-        f_hdr = wb.add_format({'bold': True, 'bg_color': '#111111', 'font_color': '#FFFFFF', 'border': 1})
-        
-        sheets = [
-            ('🚨 Fraud & Typos', results['fraud_risk'], '#FFE4E1'),
-            ('🔴 Overdue Danger', results['overdue'], '#FFCCCC'),
-            ('🟠 Forgotten Resets', results['forgotten_reset'], '#FFF3CD'),
-            ('⚠️ Date Conflicts', results['date_conflicts'], '#FFFDE7'),
-            ('👻 Ghosts', results['ghost'], '#F0F0F0'),
-            ('✅ Perfect Syncs', results['perfect_sync'], '#E8F5E9'),
-            ('📋 Unlogged', results['unlogged'], '#FFFFFF'),
-        ]
-        
-        # Write Summary
-        summ_data = {
-            'Metric': [s[0] for s in sheets], 
-            'Count': [len(s[1]) for s in sheets]
-        }
-        pd.DataFrame(summ_data).to_excel(w, sheet_name='Summary', index=False)
-        
-        # Write Data Sheets
-        for name, data, color in sheets:
-            safe_name = name[-30:] # Excel sheet name limit
-            if not data:
-                pd.DataFrame([{'Note': 'No items in this category.'}]).to_excel(w, sheet_name=safe_name, index=False)
-                continue
-                
-            df = pd.DataFrame(data)
-            df.to_excel(w, sheet_name=safe_name, index=False)
-            ws = w.sheets[safe_name]
-            fmt = wb.add_format({'bg_color': color, 'border': 1})
-            
-            for col_idx, col_name in enumerate(df.columns):
-                ws.write(0, col_idx, col_name, f_hdr)
-                ws.set_column(col_idx, col_idx, 25)
-                
-            for r_idx in range(len(df)):
-                for c_idx in range(len(df.columns)):
-                    ws.write(r_idx + 1, c_idx, str(df.iloc[r_idx, c_idx]), fmt)
-                    
-    return out.getvalue()
+def generate_excel_report(results: dict, audit_date: datetime,
+                          vessel_meta: dict) -> bytes:
+    """Generate a color-coded Excel audit report."""
+    output = io.BytesIO()
 
-def render_card(val, label, color):
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        wb = writer.book
+
+        # Formats
+        hdr_fmt = wb.add_format({
+            'bold': True, 'bg_color': '#1a1a2e', 'font_color': '#FFFFFF',
+            'border': 1, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True
+        })
+        red_fmt = wb.add_format({'bg_color': '#FFE4E1', 'border': 1, 'text_wrap': True})
+        orange_fmt = wb.add_format({'bg_color': '#FFF3CD', 'border': 1, 'text_wrap': True})
+        green_fmt = wb.add_format({'bg_color': '#E8F5E9', 'border': 1, 'text_wrap': True})
+        yellow_fmt = wb.add_format({'bg_color': '#FFFDE7', 'border': 1, 'text_wrap': True})
+        normal_fmt = wb.add_format({'border': 1, 'text_wrap': True})
+
+        # ── Summary Sheet ──
+        summary_data = {
+            'Audit Metric': [
+                'Vessel', 'Audit Date', 'Total PMS Components Analyzed',
+                '✅ Verified Syncs', '🔴 Physics Violations',
+                '⚠️ Date Conflicts', '🟡 Incomplete Records',
+                '👻 Ghost Overhauls', '📋 Unlogged Jobs'
+            ],
+            'Count / Value': [
+                vessel_meta.get('vessel', 'MV ALEXIS'),
+                audit_date.strftime('%d-%m-%Y'),
+                str(len(results['verified_syncs']) + len(results['physics_violations']) +
+                    len(results['date_conflicts']) + len(results['ghost_overhauls']) +
+                    len(results['missing_hours'])),
+                str(len(results['verified_syncs'])),
+                str(len(results['physics_violations'])),
+                str(len(results['date_conflicts'])),
+                str(len(results['missing_hours'])),
+                str(len(results['ghost_overhauls'])),
+                str(len(results['unlogged_jobs'])),
+            ]
+        }
+        pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
+
+        # ── Write each tier ──
+        sheets = [
+            ('Physics Violations', results['physics_violations'], red_fmt),
+            ('Date Conflicts', results['date_conflicts'], orange_fmt),
+            ('Verified Syncs', results['verified_syncs'], green_fmt),
+            ('Ghost Overhauls', results['ghost_overhauls'], yellow_fmt),
+            ('Incomplete Records', results['missing_hours'], orange_fmt),
+            ('Unlogged Jobs', results['unlogged_jobs'], yellow_fmt),
+        ]
+
+        for sheet_name, data, row_fmt in sheets:
+            if not data:
+                pd.DataFrame([{'Note': 'No items in this category.'}]).to_excel(
+                    writer, sheet_name=sheet_name, index=False)
+                continue
+
+            df = pd.DataFrame(data)
+            df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=1)
+            ws = writer.sheets[sheet_name]
+
+            # Write headers
+            for col_idx, col_name in enumerate(df.columns):
+                ws.write(0, col_idx, col_name, hdr_fmt)
+
+            # Apply row formatting
+            for row_idx in range(len(df)):
+                for col_idx in range(len(df.columns)):
+                    ws.write(row_idx + 1, col_idx,
+                             str(df.iloc[row_idx, col_idx]), row_fmt)
+
+            # Auto-fit columns
+            for col_idx, col_name in enumerate(df.columns):
+                max_width = max(len(col_name), 15)
+                ws.set_column(col_idx, col_idx, min(max_width, 40))
+
+    return output.getvalue()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STREAMLIT UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_custom_css():
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+
+    html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
+
+    .main { background: #0d0d1a; }
+
+    .metric-card {
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        border: 1px solid #2a2a4a;
+        border-radius: 12px;
+        padding: 1.2rem 1.5rem;
+        text-align: center;
+        transition: transform 0.2s;
+    }
+    .metric-card:hover { transform: translateY(-2px); }
+
+    .metric-value { font-size: 2.5rem; font-weight: 700; font-family: 'JetBrains Mono'; }
+    .metric-label { font-size: 0.8rem; color: #8888aa; text-transform: uppercase; letter-spacing: 0.1em; margin-top: 0.25rem; }
+
+    .tier-header {
+        font-family: 'Space Grotesk'; font-weight: 700; font-size: 1rem;
+        text-transform: uppercase; letter-spacing: 0.15em;
+        padding: 0.5rem 1rem; border-radius: 6px; margin-bottom: 1rem;
+        display: inline-block;
+    }
+    .tier-red { background: #3d1a1a; color: #ff6b6b; border: 1px solid #ff6b6b40; }
+    .tier-orange { background: #3d2a1a; color: #ffa06b; border: 1px solid #ffa06b40; }
+    .tier-green { background: #1a3d1a; color: #6bffa0; border: 1px solid #6bffa040; }
+    .tier-yellow { background: #3d3d1a; color: #ffe06b; border: 1px solid #ffe06b40; }
+    .tier-blue { background: #1a2a3d; color: #6bb5ff; border: 1px solid #6bb5ff40; }
+
+    .stDataFrame { border-radius: 8px; overflow: hidden; }
+    div[data-testid="stSidebar"] { background: #0d0d1a; border-right: 1px solid #1a1a2e; }
+    .stButton>button {
+        background: linear-gradient(135deg, #6c63ff, #5a54d6);
+        color: white; border: none; border-radius: 8px;
+        font-family: 'Space Grotesk'; font-weight: 600;
+        letter-spacing: 0.05em; transition: all 0.2s;
+    }
+    .stButton>button:hover { transform: translateY(-1px); box-shadow: 0 4px 20px #6c63ff40; }
+
+    .pipeline-title {
+        font-family: 'JetBrains Mono'; font-size: 2.5rem; font-weight: 700;
+        background: linear-gradient(135deg, #6c63ff, #a56cff, #ff6ca5);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        letter-spacing: -0.02em;
+    }
+    .pipeline-sub {
+        color: #6666aa; font-size: 0.9rem; letter-spacing: 0.1em;
+        text-transform: uppercase; margin-top: -0.5rem;
+    }
+    .anchor-line {
+        height: 2px;
+        background: linear-gradient(90deg, #6c63ff, #ff6ca5, transparent);
+        margin: 1rem 0 2rem 0;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+def render_metric_card(value, label, color="#6c63ff"):
     return f"""
-    <div class="metric-card" style="border-top: 4px solid {color}">
-        <div class="metric-value" style="color:{color}">{val}</div>
+    <div class="metric-card">
+        <div class="metric-value" style="color:{color}">{value}</div>
         <div class="metric-label">{label}</div>
     </div>
     """
 
 def main():
-    st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;700&display=swap');
-    html, body, [class*="css"] {font-family: 'Space Grotesk', sans-serif;}
-    .main {background: #0d0d1a; color: white;}
-    .metric-card {background: #1a1a2e; border-radius: 8px; padding: 1.5rem; text-align: center; margin-bottom: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,0.3);}
-    .metric-value {font-size: 2.5rem; font-weight: 700; font-family: 'JetBrains Mono';}
-    .metric-label {font-size: 0.85rem; color: #8888aa; text-transform: uppercase; letter-spacing: 1px; margin-top: 0.5rem;}
-    div[data-testid="stSidebar"] {background: #0a0a14; border-right: 1px solid #222233;}
-    .stButton>button {background: linear-gradient(135deg, #6c63ff, #5a54d6); color: white; font-weight: bold; border-radius: 8px; border: none;}
-    .stButton>button:hover {background: linear-gradient(135deg, #5a54d6, #4843b4); box-shadow: 0 0 15px rgba(108, 99, 255, 0.4);}
-    </style>
-    """, unsafe_allow_html=True)
+    apply_custom_css()
 
+    if 'audit_results' not in st.session_state:
+        st.session_state.audit_results = None
+    if 'audit_meta' not in st.session_state:
+        st.session_state.audit_meta = {}
+    if 'pms_df' not in st.session_state:
+        st.session_state.pms_df = None
+    if 'tec_entries' not in st.session_state:
+        st.session_state.tec_entries = None
+
+    # ── SIDEBAR ──
     with st.sidebar:
-        st.markdown('<h2 style="color:#6c63ff; font-weight:bold; font-family:\'JetBrains Mono\';">⚓ THE TRUTH ENGINE</h2>', unsafe_allow_html=True)
-        st.markdown('<p style="color:#88a; font-size:0.9rem; text-transform:uppercase;">Zero-Trust Forensic Audit v3.0</p><hr style="border-color:#334">', unsafe_allow_html=True)
-        
-        vessel_name = st.text_input("Vessel Name", "MV ALEXIS")
-        audit_date_input = st.date_input("Audit Date", date.today())
-        match_threshold = st.slider("Fuzzy Match Threshold (%)", min_value=40, max_value=90, value=58, step=2)
-        
-        st.markdown("<br><b>1. UPLOAD PMS EXCEL</b>", unsafe_allow_html=True)
-        pms_file = st.file_uploader("PMS Data", type=['xlsx', 'xls'], label_visibility="collapsed")
-        
-        st.markdown("<br><b>2. UPLOAD TEC-19 DIARY</b>", unsafe_allow_html=True)
-        tec_files = st.file_uploader("TEC-19 Logs", type=['doc', 'docx'], accept_multiple_files=True, label_visibility="collapsed")
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        run_clicked = st.button("▶ EXECUTE TRUTH AUDIT", type='primary', use_container_width=True, disabled=not (pms_file and tec_files))
+        st.markdown("""
+        <div class="pipeline-title">⚓ TEMPORAL<br>PIPELINE</div>
+        <div class="pipeline-sub">Zero-Trust Audit Engine v2.0</div>
+        <div class="anchor-line"></div>
+        """, unsafe_allow_html=True)
 
-    if run_clicked:
-        audit_dt = datetime.combine(audit_date_input, datetime.min.time())
-        
-        with st.status("🔬 Extracting Truth Vectors...", expanded=True) as status:
-            st.write("📊 Parsing PMS Ledger...")
-            pms_df, pms_error = parse_pms_excel(pms_file.getvalue())
-            if pms_error:
-                st.error(pms_error)
-                status.update(label="Audit Failed", state="error")
-                st.stop()
-                
-            st.write("📝 Parsing TEC-19 Work Diary...")
-            tec_entries = parse_tec19_files(tec_files)
-            if not tec_entries:
-                st.error("No valid maintenance action entries found in TEC-19.")
-                status.update(label="Audit Failed", state="error")
-                st.stop()
-                
-            st.write("🔗 Executing Bipartite Veto Match & Math Reconstruction...")
-            results = run_truth_engine(pms_df, tec_entries, audit_dt, match_threshold)
-            
-            status.update(label="✅ Audit Complete.", state="complete")
-            
-        # Display Results Dashboard
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.markdown(render_card(len(results['fraud_risk']), "Fraud / Typo Risk", "#ff4444"), unsafe_allow_html=True)
-        c2.markdown(render_card(len(results['overdue']), "Danger Overdue", "#ff9933"), unsafe_allow_html=True)
-        c3.markdown(render_card(len(results['forgotten_reset']), "Forgotten Resets", "#ffcc00"), unsafe_allow_html=True)
-        c4.markdown(render_card(len(results['ghost']), "Ghosts", "#aa44ff"), unsafe_allow_html=True)
-        c5.markdown(render_card(len(results['perfect_sync']), "Perfect Syncs", "#44ff44"), unsafe_allow_html=True)
+        st.markdown("**VESSEL CONFIGURATION**")
+        vessel_name = st.text_input("Vessel Name", value="MV ALEXIS", label_visibility="collapsed",
+                                     placeholder="Vessel Name")
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        
-        report_bytes = generate_excel_report(results, vessel_name, audit_dt)
-        st.download_button(
-            label="📥 DOWNLOAD FORENSIC TRUTH REPORT (EXCEL)", 
-            data=report_bytes, 
-            file_name=f"Truth_Report_{vessel_name.replace(' ', '_')}.xlsx", 
-            use_container_width=True
+        st.markdown("**AUDIT DATE**")
+        audit_date_input = st.date_input(
+            "Select audit date",
+            value=date.today(),
+            label_visibility="collapsed"
         )
 
-        st.markdown("<hr>", unsafe_allow_html=True)
+        st.markdown("**MATCH SENSITIVITY**")
+        match_threshold = st.slider(
+            "Fuzzy match threshold (%)",
+            min_value=40, max_value=90, value=58, step=2,
+            help="Lower = more matches (may include false positives). Higher = stricter matching."
+        )
 
-        # Tabs for detailed viewing
-        tab_names = [
-            f"🚨 Fraud/Typos ({len(results['fraud_risk'])})", 
-            f"🔴 Overdue ({len(results['overdue'])})", 
-            f"🟠 Forgotten Resets ({len(results['forgotten_reset'])})", 
-            f"⚠️ Dates ({len(results['date_conflicts'])})", 
-            f"👻 Ghosts ({len(results['ghost'])})", 
-            f"✅ Perfect ({len(results['perfect_sync'])})"
+        st.divider()
+
+        st.markdown("**① UPLOAD PMS LEDGER**")
+        pms_file = st.file_uploader(
+            "PMS Excel file",
+            type=['xlsx', 'xls'],
+            label_visibility="collapsed",
+            key="pms_upload"
+        )
+
+        st.markdown("**② UPLOAD TEC-19 DIARY**")
+        tec_files = st.file_uploader(
+            "TEC-19 Word file(s)",
+            type=['doc', 'docx'],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key="tec_upload"
+        )
+
+        st.divider()
+
+        run_clicked = st.button(
+            "▶  EXECUTE AUDIT",
+            type="primary",
+            use_container_width=True,
+            disabled=(pms_file is None or not tec_files)
+        )
+
+        if pms_file is None or not tec_files:
+            st.caption("Upload both files to enable the audit.")
+
+    # ── MAIN CONTENT ──
+    st.markdown("""
+    <div class="pipeline-title" style="font-size:2rem">RECONCILIATION DASHBOARD</div>
+    <div class="pipeline-sub">Cross-referencing PMS Ledger ↔ TEC-19 Maintenance Diary</div>
+    <div class="anchor-line"></div>
+    """, unsafe_allow_html=True)
+
+    # ── RUN AUDIT ──
+    if run_clicked:
+        audit_dt = datetime.combine(audit_date_input, datetime.min.time())
+
+        with st.status("🔬 Running Zero-Trust Audit Pipeline...", expanded=True) as status:
+            # Step 1: Parse PMS
+            st.write("📊 Parsing PMS Ledger (Excel)...")
+            pms_df, pms_error, pms_meta = parse_pms_excel(pms_file.getvalue())
+            if pms_error:
+                st.error(f"PMS Parse Error: {pms_error}")
+                status.update(label="Audit failed.", state="error")
+                st.stop()
+
+            st.write(f"✅ PMS: {len(pms_df)} components extracted from sheet '{pms_meta.get('sheet_name')}'")
+
+            # Step 2: Parse TEC-19
+            st.write(f"📝 Parsing {len(tec_files)} TEC-19 diary file(s)...")
+            tec_entries = parse_tec19_files(tec_files)
+
+            if not tec_entries:
+                st.error("No maintenance action entries found in the TEC-19 diary files. "
+                         "Check that the files contain work descriptions with dates.")
+                status.update(label="Audit failed.", state="error")
+                st.stop()
+
+            st.write(f"✅ TEC-19: {len(tec_entries)} maintenance action entries extracted")
+
+            # Step 3: Run audit
+            st.write("🔗 Running fuzzy cross-reference and physics validation...")
+            results = run_audit(pms_df, tec_entries, audit_dt, match_threshold)
+
+            total = (len(results['verified_syncs']) + len(results['physics_violations']) +
+                     len(results['date_conflicts']) + len(results['ghost_overhauls']) +
+                     len(results['missing_hours']))
+
+            st.session_state.audit_results = results
+            st.session_state.audit_meta = {
+                'vessel': vessel_name,
+                'audit_date': audit_dt,
+                'pms_meta': pms_meta,
+                'tec_count': len(tec_entries),
+                'pms_count': len(pms_df),
+            }
+            st.session_state.pms_df = pms_df
+            st.session_state.tec_entries = tec_entries
+
+            status.update(label=f"✅ Audit Complete — {total} components processed.", state="complete")
+
+    # ── DISPLAY RESULTS ──
+    if st.session_state.audit_results:
+        res = st.session_state.audit_results
+        meta = st.session_state.audit_meta
+        audit_dt = meta.get('audit_date', datetime.now())
+
+        # ── Metrics Row ──
+        total = (len(res['verified_syncs']) + len(res['physics_violations']) +
+                 len(res['date_conflicts']) + len(res['ghost_overhauls']) +
+                 len(res['missing_hours']))
+
+        cols = st.columns(6)
+        metrics = [
+            (total, "Total Analyzed", "#6c63ff"),
+            (len(res['verified_syncs']), "Verified Syncs", "#4caf50"),
+            (len(res['physics_violations']), "Physics Violations", "#f44336"),
+            (len(res['date_conflicts']), "Date Conflicts", "#ff9800"),
+            (len(res['ghost_overhauls']), "Ghost Overhauls", "#9c27b0"),
+            (len(res['missing_hours']), "Missing Hours", "#ffc107"),
         ]
-        
-        tabs = st.tabs(tab_names)
-        
-        with tabs[0]: st.dataframe(pd.DataFrame(results['fraud_risk']), use_container_width=True)
-        with tabs[1]: st.dataframe(pd.DataFrame(results['overdue']), use_container_width=True)
-        with tabs[2]: st.dataframe(pd.DataFrame(results['forgotten_reset']), use_container_width=True)
-        with tabs[3]: st.dataframe(pd.DataFrame(results['date_conflicts']), use_container_width=True)
-        with tabs[4]: st.dataframe(pd.DataFrame(results['ghost']), use_container_width=True)
-        with tabs[5]: st.dataframe(pd.DataFrame(results['perfect_sync']), use_container_width=True)
+
+        for col, (val, label, color) in zip(cols, metrics):
+            with col:
+                st.markdown(render_metric_card(val, label, color), unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Export Button ──
+        report_bytes = generate_excel_report(res, audit_dt, meta)
+        st.download_button(
+            label="📥 Download Full Audit Report (Excel)",
+            data=report_bytes,
+            file_name=f"audit_report_{meta.get('vessel', 'vessel').replace(' ', '_')}_{audit_dt.strftime('%Y%m%d')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="secondary"
+        )
+
+        st.divider()
+
+        # ── Tabbed Results ──
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+            f"🔴 Physics Violations ({len(res['physics_violations'])})",
+            f"⚠️ Date Conflicts ({len(res['date_conflicts'])})",
+            f"✅ Verified Syncs ({len(res['verified_syncs'])})",
+            f"👻 Ghost Overhauls ({len(res['ghost_overhauls'])})",
+            f"🟡 Missing Hours ({len(res['missing_hours'])})",
+            f"📋 Unlogged Jobs ({len(res['unlogged_jobs'])})",
+        ])
+
+        with tab1:
+            st.markdown('<div class="tier-header tier-red">🔴 PHYSICS VIOLATIONS — Critical Risk</div>', unsafe_allow_html=True)
+            st.caption("These components show running hours that EXCEED what was physically possible since the reported overhaul date. "
+                       "This proves the hour counter was never reset, or the overhaul date is fabricated.")
+            if res['physics_violations']:
+                st.dataframe(pd.DataFrame(res['physics_violations']), use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ No physics violations detected.")
+
+        with tab2:
+            st.markdown('<div class="tier-header tier-orange">⚠️ DATE CONFLICTS — Requires Investigation</div>', unsafe_allow_html=True)
+            st.caption("A matching job was found in the TEC-19 diary, but the completion date differs from what the PMS ledger claims.")
+            if res['date_conflicts']:
+                st.dataframe(pd.DataFrame(res['date_conflicts']), use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ No date conflicts detected.")
+
+        with tab3:
+            st.markdown('<div class="tier-header tier-green">✅ VERIFIED SYNCS — Clean Records</div>', unsafe_allow_html=True)
+            st.caption("Both the date and hours match between PMS and TEC-19 diary, and the physics check passes.")
+            if res['verified_syncs']:
+                st.dataframe(pd.DataFrame(res['verified_syncs']), use_container_width=True, hide_index=True)
+            else:
+                st.info("No fully verified syncs yet. Adjust the match threshold if needed.")
+
+        with tab4:
+            st.markdown('<div class="tier-header tier-yellow">👻 GHOST OVERHAULS — No TEC Evidence</div>', unsafe_allow_html=True)
+            st.caption("The PMS ledger claims an overhaul was performed, but no corresponding entry was found in ANY TEC-19 diary. "
+                       "This may indicate phantom record entries.")
+            if res['ghost_overhauls']:
+                st.dataframe(pd.DataFrame(res['ghost_overhauls']), use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ No ghost overhauls detected.")
+
+        with tab5:
+            st.markdown('<div class="tier-header tier-orange">🟡 INCOMPLETE RECORDS — Admin Deficiency</div>', unsafe_allow_html=True)
+            st.caption("A matching TEC-19 entry confirms the work was done, but the running hours were not properly recorded in the PMS.")
+            if res['missing_hours']:
+                st.dataframe(pd.DataFrame(res['missing_hours']), use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ No incomplete records detected.")
+
+        with tab6:
+            st.markdown('<div class="tier-header tier-blue">📋 UNLOGGED JOBS — Work Without PMS Entry</div>', unsafe_allow_html=True)
+            st.caption("These jobs were recorded in the TEC-19 diary but have NO matching component in the PMS ledger. "
+                       "This may indicate unplanned maintenance or components not yet added to the PMS.")
+            if res['unlogged_jobs']:
+                st.dataframe(pd.DataFrame(res['unlogged_jobs']), use_container_width=True, hide_index=True)
+            else:
+                st.success("✅ All diary entries are accounted for in the PMS.")
+
+        # ── Debug Info ──
+        with st.expander("🔧 Audit Diagnostics & Column Mapping", expanded=False):
+            pms_meta = meta.get('pms_meta', {})
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**PMS Column Mapping**")
+                st.json(pms_meta.get('col_map', {}))
+            with col2:
+                st.markdown("**Monthly Hours Columns**")
+                st.json(pms_meta.get('monthly_cols', {}))
+
+            st.markdown(f"**PMS Components Parsed:** {meta.get('pms_count', 0)}")
+            st.markdown(f"**TEC-19 Action Entries Extracted:** {meta.get('tec_count', 0)}")
+            st.markdown(f"**Fuzzy Match Threshold Used:** {match_threshold}%")
+
+    else:
+        # ── Welcome State ──
+        st.markdown("""
+        <div style="text-align:center; padding: 4rem 2rem; color: #4444aa;">
+            <div style="font-size:4rem; margin-bottom:1rem">⚓</div>
+            <div style="font-size:1.3rem; font-family: 'JetBrains Mono'; color:#6666cc;">
+                AWAITING UPLINK
+            </div>
+            <div style="font-size:0.9rem; margin-top:0.5rem; color:#444477; max-width:500px; margin-left:auto; margin-right:auto;">
+                Upload the PMS Excel ledger and TEC-19 diary files in the sidebar,
+                then press EXECUTE AUDIT to begin the zero-trust cross-reference.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Info cards
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.info("**① Upload PMS Ledger**\n\nThe Excel spreadsheet containing component codes, overhaul dates, and running hours.")
+        with c2:
+            st.info("**② Upload TEC-19 Diary**\n\nThe Word document(s) where the Chief Engineer logged completed maintenance work.")
+        with c3:
+            st.info("**③ Set Audit Date**\n\nChoose the inspection date. The engine uses this to calculate maximum possible elapsed hours since each overhaul.")
 
 if __name__ == "__main__":
     main()
